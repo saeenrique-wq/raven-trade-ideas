@@ -578,54 +578,114 @@ def strat_bb_squeeze(df_h1, precio):
     return None
 
 
-def strat_precio_accion(df_h1, precio, df_d1=None):
-    """Patrones de vela en H1: Engulfing y Pin Bar"""
+def strat_precio_accion(df_h1, precio, df_d1=None, df_h4=None):
+    """
+    Patrones de vela H1: Engulfing y Pin Bar.
+    REGLAS ANTI-RUIDO:
+    1. Filtro MTF — si 2+ TF apuntan en contra, bloquear señal
+    2. Confirmación de nivel — precio debe RESPETAR el nivel (no romperlo)
+    3. Solo permite contra-tendencia si RSI extremo (< 25 o > 75)
+    """
     if df_h1 is None or len(df_h1) < 5:
         return None
     at = _atr(df_h1).iloc[-1]
     rh = _rsi(df_h1.close).iloc[-1]
+    # Usar barra [-2] para patrón completado, [-1] para confirmación parcial
     o2,h2,l2,c2 = df_h1[["open","high","low","close"]].iloc[-2].values
     o1,h1_,l1,c1 = df_h1[["open","high","low","close"]].iloc[-1].values
-    b1 = abs(c1-o1); rng1 = h1_-l1
+    b2 = abs(c2-o2); b1 = abs(c1-o1); rng1 = h1_-l1
     if rng1 < at * 0.3:
         return None
 
-    bull_eng = (c2 < o2) and (c1 > o1) and (c1 > o2) and (o1 < c2) and b1 > abs(c2-o2)*1.1
-    bear_eng = (c2 > o2) and (c1 < o1) and (c1 < o2) and (o1 > c2) and b1 > abs(c2-o2)*1.1
-    hammer   = (b1 > 0) and (c1-l1) > b1*2 and (c1 > o1) and (h1_-c1) < b1*0.5
-    shooting = (b1 > 0) and (h1_-c1) > b1*2 and (c1 < o1) and (c1-l1) < b1*0.5
+    # Detectar patrones en barra completada [-2]
+    bull_eng = (c2 > o2) and b2 > abs(c1-o1)*0.8   # vela alcista fuerte anterior
+    bear_eng = (c2 < o2) and b2 > abs(c1-o1)*0.8   # vela bajista fuerte anterior
+    # Patrón en barra más reciente [-1]
+    hammer   = (b1 > 0) and (c1-l1) > b1*2.5 and (c1 > o1) and (h1_-c1) < b1*0.4
+    shooting = (b1 > 0) and (h1_-c1) > b1*2.5 and (c1 < o1) and (c1-l1) < b1*0.4
+    # Engulfing entre barras [-2] y [-1]
+    eng_bull = (c2 < o2) and (c1 > o1) and (c1 > o2) and (o1 < c2) and b1 > b2*1.1
+    eng_bear = (c2 > o2) and (c1 < o1) and (c1 < o2) and (o1 > c2) and b1 > b2*1.1
 
-    # Verificar nivel clave (redondo $50/$100 o prev-day H/L)
+    buy_pattern  = hammer or eng_bull
+    sell_pattern = shooting or eng_bear
+    if not buy_pattern and not sell_pattern:
+        return None
+
+    # ── FILTRO MTF ────────────────────────────────────────────────────────────
+    # Contar cuántos TF están en tendencia bajista o alcista
+    mtf_bear = 0
+    mtf_bull = 0
+    if df_d1 is not None and len(df_d1) >= 50:
+        e20d = _ema(df_d1.close, 20).iloc[-1]
+        if df_d1.close.iloc[-1] < e20d: mtf_bear += 1
+        else:                            mtf_bull += 1
+    if df_h4 is not None and len(df_h4) >= 30:
+        e20h4 = _ema(df_h4.close, 20).iloc[-1]
+        e50h4 = _ema(df_h4.close, 50).iloc[-1]
+        if e20h4 < e50h4: mtf_bear += 1
+        else:              mtf_bull += 1
+    if len(df_h1) >= 50:
+        e50h1 = _ema(df_h1.close, 50).iloc[-1]
+        if df_h1.close.iloc[-1] < e50h1: mtf_bear += 1
+        else:                              mtf_bull += 1
+
+    # Bloquear contra-tendencia a menos que RSI sea extremo
+    if buy_pattern and mtf_bear >= 2 and rh > 28:
+        return None   # martillo en tendencia bajista fuerte = ruido
+    if sell_pattern and mtf_bull >= 2 and rh < 72:
+        return None   # estrella en tendencia alcista fuerte = ruido
+
+    # ── CONFIRMACIÓN DE NIVEL ─────────────────────────────────────────────────
+    # El precio debe estar RESPETANDO el nivel, no rompiéndolo
+    # Para BUY: precio actual >= close del patrón (no cayó a través del soporte)
+    # Para SELL: precio actual <= close del patrón (no rebotó a través de la resistencia)
+    if buy_pattern  and precio < c1 * 0.9995:
+        return None  # precio cayó por debajo del cierre → nivel roto, no comprar
+    if sell_pattern and precio > c1 * 1.0005:
+        return None  # precio subió sobre el cierre → nivel roto, no vender
+
+    # ── NIVEL CLAVE ───────────────────────────────────────────────────────────
     near_key = False
     for step in [50, 100]:
         rnd = round(precio / step) * step
-        if abs(precio - rnd) <= at * 1.2:
+        if abs(precio - rnd) <= at * 1.5:
             near_key = True; break
     if df_d1 is not None and len(df_d1) >= 2:
         pd_h = df_d1.high.iloc[-2]; pd_l = df_d1.low.iloc[-2]
-        if abs(precio - pd_h) <= at * 1.2 or abs(precio - pd_l) <= at * 1.2:
+        if abs(precio-pd_h) <= at*1.5 or abs(precio-pd_l) <= at*1.5:
             near_key = True
 
-    if (bull_eng or hammer) and rh < 62:
-        sl = l1 - at * 0.3
+    # Sin nivel clave Y contra tendencia = no vale la pena
+    if not near_key and (mtf_bear >= 1 or mtf_bull >= 1):
+        return None
+
+    tend_ctx = f"MTF: {'▼'*mtf_bear}{'▲'*mtf_bull}"
+
+    if buy_pattern and rh < 65:
+        sl = (l1 if hammer else min(l1,l2)) - at * 0.3
         r  = _risk(c1, sl, "buy")
         if r is None: return None
-        patron = "Engulfing Alcista" if bull_eng else "Martillo"
-        score  = 63 + (8 if bull_eng else 0) + (12 if near_key else 0) + (5 if rh < 40 else 0)
+        patron = "Engulfing Alcista" if eng_bull else "Martillo"
+        score  = 63 + (8 if eng_bull else 0) + (12 if near_key else 0)
+        score += (8 if rh < 35 else 0)
+        score += (5 if mtf_bull >= 1 else 0)   # bonus si al menos 1 TF a favor
         return dict(estrategia=f"PRECIO ACCIÓN — {patron}", icon="🕯️", dir="buy",
                     entry=c1, sl=sl, score_base=min(score, 91),
-                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
+                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {tend_ctx} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
                     **r)
 
-    if (bear_eng or shooting) and rh > 38:
-        sl = h1_ + at * 0.3
+    if sell_pattern and rh > 35:
+        sl = (h1_ if shooting else max(h1_,h2)) + at * 0.3
         r  = _risk(c1, sl, "sell")
         if r is None: return None
-        patron = "Engulfing Bajista" if bear_eng else "Estrella Fugaz"
-        score  = 63 + (8 if bear_eng else 0) + (12 if near_key else 0) + (5 if rh > 60 else 0)
+        patron = "Engulfing Bajista" if eng_bear else "Estrella Fugaz"
+        score  = 63 + (8 if eng_bear else 0) + (12 if near_key else 0)
+        score += (8 if rh > 65 else 0)
+        score += (5 if mtf_bear >= 1 else 0)
         return dict(estrategia=f"PRECIO ACCIÓN — {patron}", icon="🕯️", dir="sell",
                     entry=c1, sl=sl, score_base=min(score, 91),
-                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
+                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {tend_ctx} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
                     **r)
     return None
 
@@ -764,7 +824,7 @@ def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix)
         strat_ema_momentum(df_h1, df_m15, precio),
         strat_supply_demand(df_h4, df_h1, precio),
         strat_bb_squeeze(df_h1, precio),
-        strat_precio_accion(df_h1, precio, df_d1),
+        strat_precio_accion(df_h1, precio, df_d1, df_h4),
     ]
 
     senales = []
@@ -784,8 +844,44 @@ def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix)
         senales.append(s)
 
     senales.sort(key=lambda x: x["score"], reverse=True)
+
+    # ── RESOLUCIÓN DE CONFLICTOS ──────────────────────────────────────────────
+    # Si hay señales BUY y SELL al mismo tiempo → conflicto
+    # Regla: el bando con mayor score DOMINA; el otro se filtra si diff > 10 pts
+    conflicto_txt = None
+    buys  = [s for s in senales if s["dir"] == "buy"]
+    sells = [s for s in senales if s["dir"] == "sell"]
+    if buys and sells:
+        max_buy  = max(s["score"] for s in buys)
+        max_sell = max(s["score"] for s in sells)
+        diff = abs(max_buy - max_sell)
+        if diff >= 10:
+            # Eliminar el bando débil
+            dominant = "sell" if max_sell > max_buy else "buy"
+            senales = [s for s in senales if s["dir"] == dominant]
+            conflicto_txt = (
+                f"⚡ Señales contradictorias detectadas — "
+                f"{'VENTA' if dominant=='sell' else 'COMPRA'} domina "
+                f"({max(max_buy,max_sell)}/100 vs {min(max_buy,max_sell)}/100). "
+                f"Señales {'BUY' if dominant=='sell' else 'SELL'} filtradas automáticamente."
+            )
+        else:
+            conflicto_txt = (
+                f"⚠️ Mercado indeciso — señales BUY ({max_buy}/100) y SELL ({max_sell}/100) "
+                f"están demasiado equilibradas. Espera confirmación antes de entrar."
+            )
+            senales = []  # No operar en indecisión
+
     ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     n_strats = 6 if is_gold else 5
+
+    if conflicto_txt:
+        dom_color = "#ffd600" if (buys and sells and not senales) else ("#00e676" if senales and senales[0]["dir"]=="buy" else "#ff5252")
+        st.markdown(f"""
+        <div style="background:#0d0d20;border:1px solid #2a2a00;border-radius:8px;
+             padding:.8rem 1.2rem;margin-bottom:.8rem;font-size:.85em;color:{dom_color}">
+          {conflicto_txt}
+        </div>""", unsafe_allow_html=True)
 
     if n_nivel == "PELIGRO":
         st.markdown(f"""
