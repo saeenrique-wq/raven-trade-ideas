@@ -263,10 +263,11 @@ def _risk(entry, sl, direction, pp=10):
     s = 1 if direction == "buy" else -1
     return dict(
         sl_d=d,
-        tp1=entry + s*d*1.5,  rr1=1.5, g1=d*1.5*pp,
-        tp2=entry + s*d*2.5,  rr2=2.5, g2=d*2.5*pp,
-        tp3=entry + s*d*4.0,  rr3=4.0, g3=d*4.0*pp,
-        tp4=entry + s*d*6.0,  rr4=6.0, g4=d*6.0*pp,
+        tp1=entry + s*d*1.5,  rr1=1.5,  g1=d*1.5*pp,
+        tp2=entry + s*d*2.5,  rr2=2.5,  g2=d*2.5*pp,
+        tp3=entry + s*d*4.0,  rr3=4.0,  g3=d*4.0*pp,
+        tp4=entry + s*d*6.0,  rr4=6.0,  g4=d*6.0*pp,
+        tp5=entry + s*d*9.0,  rr5=9.0,  g5=d*9.0*pp,
         riesgo=d*pp,
     )
 
@@ -850,12 +851,14 @@ def _registrar_senal(s, symbol):
         "tipo":       s.get("tipo",""),
         "estrategia": s["estrategia"],
         "score":      s["score"],
-        "entry":      round(s["entry"], 2),
-        "sl":         round(s["sl"], 2),
-        "tp1":        round(s["tp1"], 2),
-        "tp2":        round(s["tp2"], 2),
-        "tp3":        round(s["tp3"], 2),
-        "resultado":  None,    # None = pendiente
+        "entry":      round(s["entry"], 4),
+        "sl":         round(s["sl"], 4),
+        "tp1":        round(s["tp1"], 4),
+        "tp2":        round(s["tp2"], 4),
+        "tp3":        round(s["tp3"], 4),
+        "tp4":        round(s.get("tp4", s["tp3"]), 4),
+        "tp5":        round(s.get("tp5", s["tp3"]), 4),
+        "resultado":  None,
         "ts":         ahora,
     })
     _save_history(hist)
@@ -869,17 +872,32 @@ def _actualizar_historial(symbol, precio_actual_):
             continue
         p = precio_actual_
         if h["dir"] == "buy":
-            if p >= h["tp3"]:  h["resultado"] = "✅ TP3"; cambio = True
-            elif p >= h["tp2"]: h["resultado"] = "✅ TP2"; cambio = True
-            elif p >= h["tp1"]: h["resultado"] = "✅ TP1"; cambio = True
-            elif p <= h["sl"]:  h["resultado"] = "❌ SL";  cambio = True
+            if   p >= h.get("tp5", float("inf")): h["resultado"] = "✅ TP5"; cambio = True
+            elif p >= h.get("tp4", float("inf")): h["resultado"] = "✅ TP4"; cambio = True
+            elif p >= h["tp3"]:                    h["resultado"] = "✅ TP3"; cambio = True
+            elif p >= h["tp2"]:                    h["resultado"] = "✅ TP2"; cambio = True
+            elif p >= h["tp1"]:                    h["resultado"] = "✅ TP1"; cambio = True
+            elif p <= h["sl"]:                     h["resultado"] = "❌ SL";  cambio = True
         else:
-            if p <= h["tp3"]:  h["resultado"] = "✅ TP3"; cambio = True
-            elif p <= h["tp2"]: h["resultado"] = "✅ TP2"; cambio = True
-            elif p <= h["tp1"]: h["resultado"] = "✅ TP1"; cambio = True
-            elif p >= h["sl"]:  h["resultado"] = "❌ SL";  cambio = True
+            if   p <= h.get("tp5", float("-inf")): h["resultado"] = "✅ TP5"; cambio = True
+            elif p <= h.get("tp4", float("-inf")): h["resultado"] = "✅ TP4"; cambio = True
+            elif p <= h["tp3"]:                     h["resultado"] = "✅ TP3"; cambio = True
+            elif p <= h["tp2"]:                     h["resultado"] = "✅ TP2"; cambio = True
+            elif p <= h["tp1"]:                     h["resultado"] = "✅ TP1"; cambio = True
+            elif p >= h["sl"]:                      h["resultado"] = "❌ SL";  cambio = True
     if cambio:
         _save_history(hist)
+
+def _wr_senal(estrategia):
+    """Win rate de esta estrategia desde el historial local."""
+    prefix = estrategia.split("—")[0].strip()
+    hist = _load_history()
+    rel   = [h for h in hist if h.get("estrategia","").startswith(prefix)]
+    done  = [h for h in rel  if h.get("resultado") is not None]
+    if len(done) < 2:
+        return None
+    wins  = sum(1 for h in done if str(h.get("resultado","")).startswith("✅"))
+    return round(wins / len(done) * 100)
 
 def _render_historial(symbol):
     hist = [h for h in _load_history() if h.get("symbol") == symbol]
@@ -927,72 +945,104 @@ def _news_badge(nivel):
     m = {"PELIGRO": "badge-danger", "PRECAUCIÓN": "badge-caution", "SEGURO": "badge-safe"}
     return f'<span class="{m.get(nivel,"badge-safe")}">{nivel}</span>'
 
-def _tipo_badge(tipo):
-    cfg = {
-        "🎯 SCALP":    ("background:#2a1a00;color:#ffd600;border:1px solid #4a3000", "🎯 SCALP"),
-        "📅 INTRADAY": ("background:#001a2a;color:#42a5f5;border:1px solid #003a5a", "📅 INTRADAY"),
-        "📊 SWING":    ("background:#001a0d;color:#00e676;border:1px solid #004020", "📊 SWING"),
-    }
-    st_cfg = cfg.get(tipo, ("background:#1a1a30;color:#aaa;border:1px solid #333", tipo))
-    return f'<span style="{st_cfg[0]};padding:2px 9px;border-radius:12px;font-size:.72em;font-weight:700">{st_cfg[1]}</span>'
+_TIPO_CFG = {
+    "🎯 SCALP":    ("#2a1a00", "#ffd600", "#4a3000"),
+    "📅 INTRADAY": ("#001a2a", "#42a5f5", "#003a5a"),
+    "📊 SWING":    ("#001a0d", "#00e676", "#004020"),
+}
 
-def _card(s, news_nivel, news_txt):
+def _tipo_badge(tipo):
+    bg, fg, br = _TIPO_CFG.get(tipo, ("#1a1a30", "#aaa", "#333"))
+    return (f'<span style="background:{bg};color:{fg};border:1px solid {br};'
+            f'padding:2px 10px;border-radius:12px;font-size:.72em;font-weight:700">{tipo}</span>')
+
+def _card(s, news_nivel, news_txt, decimals=2):
+    def f(v): return _fmt(v, decimals)
     cls, col, stars = _clase(s["score"])
-    dc = "#00e676" if s["dir"] == "buy" else "#ff5252"
-    dt = "▲ COMPRA" if s["dir"] == "buy" else "▼ VENTA"
-    cc = "card-buy" if s["dir"] == "buy" else "card-sell"
-    nb = _news_badge(news_nivel)
-    tipo = s.get("tipo", "")
-    dur  = s.get("duracion", "")
-    tb = _tipo_badge(tipo)
+    dc  = "#00e676" if s["dir"] == "buy" else "#ff5252"
+    dt  = "▲ COMPRA" if s["dir"] == "buy" else "▼ VENTA"
+    cc  = "card-buy"  if s["dir"] == "buy" else "card-sell"
+    nb  = _news_badge(news_nivel)
+    tb  = _tipo_badge(s.get("tipo",""))
+    dur = s.get("duracion","")
+
+    # Rango de entrada: ±15 % del riesgo
+    ez = s["sl_d"] * 0.15
+    if s["dir"] == "buy":
+        e_lo, e_hi = s["entry"] - ez, s["entry"] + ez
+    else:
+        e_lo, e_hi = s["entry"] - ez, s["entry"] + ez
+
+    # Win rate desde historial
+    wr = _wr_senal(s["estrategia"])
+    wr_html = (f'<span style="background:#0a2a0a;color:#69f0ae;border:1px solid #1a4a1a;'
+               f'padding:2px 9px;border-radius:10px;font-size:.72em;font-weight:700">'
+               f'WR {wr}%</span>') if wr is not None else ""
+
     return f"""
 <div class="{cc}">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+  <!-- CABECERA -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
     <div>
-      <span style="color:{dc};font-size:1.25em;font-weight:900">{dt}</span>
-      <span style="color:#aaa;margin-left:10px;font-size:.9em">{s['icon']} {s['estrategia']}</span>
-      <div style="margin-top:4px;display:flex;gap:6px;align-items:center">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="color:{dc};font-size:1.3em;font-weight:900">{dt}</span>
+        <span style="color:#bbb;font-size:.92em">{s['icon']} {s['estrategia']}</span>
+      </div>
+      <div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         {tb}
-        <span style="color:#444;font-size:.74em">⏱ {dur}</span>
+        <span style="color:#555;font-size:.74em">⏱ {dur}</span>
+        {wr_html}
       </div>
     </div>
-    <div style="display:flex;gap:8px;align-items:center">{nb}</div>
+    <div style="text-align:right">{nb}</div>
   </div>
-  <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:10px">
-    <div>
-      <div style="color:#555;font-size:.72em">SCORE</div>
-      <div style="color:{col};font-size:1.5em;font-weight:900">{s['score']}/100</div>
-      <div style="color:{col};font-size:.78em">{cls} {stars[:2]}</div>
+
+  <!-- SCORE + ENTRADA + STOP -->
+  <div style="display:flex;gap:0;flex-wrap:wrap;margin-bottom:12px;
+              background:#0a0a15;border:1px solid #1a1a30;border-radius:8px;overflow:hidden">
+    <div style="flex:1;padding:10px 16px;border-right:1px solid #1a1a30;min-width:90px">
+      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Score</div>
+      <div style="color:{col};font-size:1.6em;font-weight:900;line-height:1.1">{s['score']}</div>
+      <div style="color:{col};font-size:.72em">{cls}</div>
     </div>
-    <div style="border-left:1px solid #222;padding-left:20px">
-      <div style="color:#555;font-size:.72em">ENTRADA</div>
-      <div style="color:#fff;font-size:1.2em;font-weight:700">{_fmt(s['entry'])}</div>
+    <div style="flex:2;padding:10px 16px;border-right:1px solid #1a1a30;min-width:140px">
+      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Zona de Entrada</div>
+      <div style="color:#fff;font-size:1.0em;font-weight:700">{f(e_lo)} — {f(e_hi)}</div>
+      <div style="color:#888;font-size:.74em">Precio exacto: {f(s['entry'])}</div>
     </div>
-    <div style="border-left:1px solid #222;padding-left:20px">
-      <div style="color:#555;font-size:.72em">STOP LOSS</div>
-      <div style="color:#ff5252;font-size:1.1em;font-weight:700">{_fmt(s['sl'])}</div>
-      <div style="color:#555;font-size:.76em">−{s['sl_d']:.1f} pts</div>
-    </div>
-  </div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-    <div style="background:#0a1a0a;border:1px solid #1a3a1a;border-radius:6px;padding:5px 12px">
-      <div style="color:#555;font-size:.68em">TP1 · 1:{s['rr1']:.1f}</div>
-      <div style="color:#00e676;font-weight:700;font-size:.95em">{_fmt(s['tp1'])}</div>
-    </div>
-    <div style="background:#0a1a0a;border:1px solid #1a3a1a;border-radius:6px;padding:5px 12px">
-      <div style="color:#555;font-size:.68em">TP2 · 1:{s['rr2']:.1f}</div>
-      <div style="color:#00e676;font-weight:700;font-size:.95em">{_fmt(s['tp2'])}</div>
-    </div>
-    <div style="background:#0a1a0a;border:1px solid #1a3a1a;border-radius:6px;padding:5px 12px">
-      <div style="color:#555;font-size:.68em">TP3 · 1:{s['rr3']:.1f}</div>
-      <div style="color:#00e676;font-weight:700;font-size:.95em">{_fmt(s['tp3'])}</div>
-    </div>
-    <div style="background:#1a1000;border:1px solid #3a2a00;border-radius:6px;padding:5px 12px">
-      <div style="color:#555;font-size:.68em">TP4 · 1:{s['rr4']:.1f}</div>
-      <div style="color:#ffd600;font-weight:700;font-size:.95em">{_fmt(s['tp4'])}</div>
+    <div style="flex:2;padding:10px 16px;min-width:140px">
+      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Stop Loss</div>
+      <div style="color:#ff5252;font-size:1.0em;font-weight:700">{f(s['sl'])}</div>
+      <div style="color:#555;font-size:.74em">Riesgo: {s['sl_d']:.{decimals}f} pts</div>
     </div>
   </div>
-  <div style="color:#666;font-size:.82em">{s['contexto']}</div>
+
+  <!-- TPs -->
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:10px">
+    <div style="background:#071507;border:1px solid #143214;border-radius:6px;padding:6px 8px;text-align:center">
+      <div style="color:#555;font-size:.64em">TP1 · 1:{s['rr1']:.1f}</div>
+      <div style="color:#69f0ae;font-weight:700;font-size:.9em">{f(s['tp1'])}</div>
+    </div>
+    <div style="background:#071507;border:1px solid #1a4a1a;border-radius:6px;padding:6px 8px;text-align:center">
+      <div style="color:#555;font-size:.64em">TP2 · 1:{s['rr2']:.1f}</div>
+      <div style="color:#00e676;font-weight:700;font-size:.9em">{f(s['tp2'])}</div>
+    </div>
+    <div style="background:#071507;border:1px solid #206020;border-radius:6px;padding:6px 8px;text-align:center">
+      <div style="color:#555;font-size:.64em">TP3 · 1:{s['rr3']:.1f}</div>
+      <div style="color:#00e676;font-weight:800;font-size:.9em">{f(s['tp3'])}</div>
+    </div>
+    <div style="background:#0d0d00;border:1px solid #3a3000;border-radius:6px;padding:6px 8px;text-align:center">
+      <div style="color:#555;font-size:.64em">TP4 · 1:{s['rr4']:.1f}</div>
+      <div style="color:#ffd600;font-weight:800;font-size:.9em">{f(s['tp4'])}</div>
+    </div>
+    <div style="background:#150a00;border:1px solid #4a2000;border-radius:6px;padding:6px 8px;text-align:center">
+      <div style="color:#555;font-size:.64em">TP5 · 1:{s['rr5']:.1f}</div>
+      <div style="color:#ff9800;font-weight:900;font-size:.9em">{f(s['tp5'])}</div>
+    </div>
+  </div>
+
+  <!-- Contexto -->
+  <div style="color:#555;font-size:.80em;padding-top:6px;border-top:1px solid #111">{s['contexto']}</div>
 </div>"""
 
 def _texto(s, news_txt):
@@ -1009,11 +1059,12 @@ def _texto(s, news_txt):
         f"{tipo}  ·  ⏱ {dur}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entrada:  {_fmt(s['entry'])}\n"
-        f"🛑 Stop:     {_fmt(s['sl'])}   (−{s['sl_d']:.1f} pts)\n"
+        f"🛑 Stop:     {_fmt(s['sl'])}   (−{s['sl_d']:.2f} pts)\n"
         f"🎯 TP1:      {_fmt(s['tp1'])}   1:{s['rr1']:.1f}\n"
         f"🎯 TP2:      {_fmt(s['tp2'])}   1:{s['rr2']:.1f}\n"
         f"🎯 TP3:      {_fmt(s['tp3'])}   1:{s['rr3']:.1f}\n"
         f"💎 TP4:      {_fmt(s['tp4'])}   1:{s['rr4']:.1f}\n"
+        f"🏆 TP5:      {_fmt(s['tp5'])}   1:{s['rr5']:.1f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📰 Noticias: {news_txt}\n"
         f"ℹ️  {s['contexto']}\n"
@@ -1030,25 +1081,39 @@ _SRC_BADGE = {
 }
 
 def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix):
+    # ── 1. FILTRO PRIMERO — antes de cargar/calcular nada ─────────────────────
+    tipo_sel = st.radio(
+        "Tipo de operación:",
+        ["🔎 TODOS", "🎯 SCALP", "📅 INTRADAY", "📊 SWING"],
+        horizontal=True, key=f"tipo_{tab_prefix}",
+        help="SCALP: 5-45 min  |  INTRADAY: 1-8h  |  SWING: 4-24h"
+    )
+    st.markdown("<hr style='border:none;border-top:1px solid #1a1a30;margin:.5rem 0 .8rem 0'>",
+                unsafe_allow_html=True)
+
+    # ── 2. Precio actual ──────────────────────────────────────────────────────
     precio, src = _get_price(symbol)
     if precio is None:
         st.error(f"❌ Sin datos para **{symbol}**. Verifica tu conexión a internet.")
         return
 
-    with st.spinner(f"Analizando {symbol}…"):
-        df_m5,  _ = _get_bars(symbol, mt5.TIMEFRAME_M5,  300)
-        df_m15, _ = _get_bars(symbol, mt5.TIMEFRAME_M15, 400)
-        df_h1,  _ = _get_bars(symbol, mt5.TIMEFRAME_H1,  400)
-        df_h4,  _ = _get_bars(symbol, mt5.TIMEFRAME_H4,  300)
-        df_d1,  _ = _get_bars(symbol, mt5.TIMEFRAME_D1,  200)
+    # ── 3. Barras — solo las que necesita el filtro elegido ───────────────────
+    need_scalp    = tipo_sel in ("🔎 TODOS", "🎯 SCALP")
+    need_intraday = tipo_sel in ("🔎 TODOS", "📅 INTRADAY")
+    need_swing    = tipo_sel in ("🔎 TODOS", "📊 SWING")
 
-    # Actualizar historial con precio actual
+    with st.spinner(f"Calculando señales {tipo_sel} para {symbol}…"):
+        df_m5  = _get_bars(symbol, mt5.TIMEFRAME_M5,  300)[0] if need_scalp    else None
+        df_m15 = _get_bars(symbol, mt5.TIMEFRAME_M15, 400)[0] if (need_scalp or need_intraday or need_swing) else None
+        df_h1  = _get_bars(symbol, mt5.TIMEFRAME_H1,  400)[0]
+        df_h4  = _get_bars(symbol, mt5.TIMEFRAME_H4,  300)[0] if (need_swing or need_intraday) else None
+        df_d1  = _get_bars(symbol, mt5.TIMEFRAME_D1,  200)[0] if (need_swing or need_intraday) else None
+
     _actualizar_historial(symbol, precio)
 
-    pp = _pip_val(symbol, src or provider)
-
-    at_h1  = _atr(df_h1).iloc[-1]       if df_h1 is not None else 0
-    rsi_h1 = _rsi(df_h1.close).iloc[-1] if df_h1 is not None else 50
+    pp     = _pip_val(symbol, src or provider)
+    at_h1  = _atr(df_h1).iloc[-1]        if df_h1 is not None else 0
+    rsi_h1 = _rsi(df_h1.close).iloc[-1]  if df_h1 is not None else 50
     e200   = _ema(df_h1.close, 200).iloc[-1] if df_h1 is not None else precio
     tend   = "▲ ALCISTA" if precio > e200 else "▼ BAJISTA"
 
@@ -1057,51 +1122,41 @@ def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"💰 {symbol}", _fmt(precio, decimals))
-    c2.metric("📊 ATR H1",       f"{at_h1:.1f} pts")
+    c2.metric("📊 ATR H1",       f"{at_h1:.{decimals}f} pts")
     c3.metric("📈 RSI H1",       f"{rsi_h1:.0f}")
     c4.metric("🧭 TENDENCIA H1", tend)
 
-    # ── FILTRO DE TIPO ────────────────────────────────────────────────────────
-    tipo_sel = st.radio(
-        "Mostrar:",
-        ["🔎 TODOS", "🎯 SCALP", "📅 INTRADAY", "📊 SWING"],
-        horizontal=True, key=f"tipo_{tab_prefix}",
-        help="SCALP: 5-45 min | INTRADAY: 1-8h | SWING: 4-24h"
-    )
-    st.markdown("<hr style='border:none;border-top:1px solid #1a1a30;margin:.6rem 0'>",
-                unsafe_allow_html=True)
-
-    # Estrategias — DJ30 no usa London Breakout (sin sesión asiática relevante)
-    yt = _yahoo_ticker(symbol)
+    # ── 4. Ejecutar SOLO estrategias del tipo seleccionado ────────────────────
+    yt      = _yahoo_ticker(symbol)
     is_gold = (yt == "GC=F") or ("xau" in symbol.lower())
 
-    def r(entry, sl, direction):
-        return _risk(entry, sl, direction, pp)
-
     candidatos = []
-    if is_gold:
+    if need_intraday and is_gold:
         candidatos.append(strat_london_breakout(df_h1, precio))
-    candidatos += [
-        strat_trend_pullback(df_d1, df_h4, df_h1, df_m15, precio),
-        strat_ema_momentum(df_h1, df_m15, precio),
-        strat_supply_demand(df_h4, df_h1, precio),
-        strat_bb_squeeze(df_h1, precio),
-        strat_precio_accion(df_h1, precio, df_d1, df_h4),
-        # SCALP (M5/M15)
-        strat_scalp_ema(df_m5, df_m15, df_h1, precio),
-        strat_scalp_momentum(df_m15, df_h1, precio),
-    ]
+    if need_swing:
+        candidatos.append(strat_trend_pullback(df_d1, df_h4, df_h1, df_m15, precio))
+        candidatos.append(strat_supply_demand(df_h4, df_h1, precio))
+    if need_intraday:
+        candidatos.append(strat_ema_momentum(df_h1, df_m15, precio))
+        candidatos.append(strat_bb_squeeze(df_h1, precio))
+        candidatos.append(strat_precio_accion(df_h1, precio, df_d1, df_h4))
+    if need_scalp:
+        candidatos.append(strat_scalp_ema(df_m5, df_m15, df_h1, precio))
+        candidatos.append(strat_scalp_momentum(df_m15, df_h1, precio))
 
+    # ── 5. Construir lista de señales válidas ─────────────────────────────────
     senales = []
     for s in candidatos:
         if s is None:
             continue
-        if "tipo" not in s:
-            s["tipo"] = "📅 INTRADAY"
-        if "duracion" not in s:
-            s["duracion"] = "—"
+        s.setdefault("tipo",    "📅 INTRADAY")
+        s.setdefault("duracion","—")
         d = s["sl_d"]
-        s.update(g1=d*1.5*pp, g2=d*2.5*pp, g3=d*4.0*pp, g4=d*6.0*pp, riesgo=d*pp)
+        s.update(
+            g1=d*1.5*pp, g2=d*2.5*pp, g3=d*4.0*pp,
+            g4=d*6.0*pp, g5=d*9.0*pp, riesgo=d*pp
+        )
+        # Recalcular TPs con decimals correctos (precios son absolutos, ya están bien)
         s["score"] = max(s["score_base"] - pen, 0)
         if s["score"] < MIN_SCORE:
             continue
@@ -1111,48 +1166,43 @@ def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix)
 
     senales.sort(key=lambda x: x["score"], reverse=True)
 
-    # ── RESOLUCIÓN DE CONFLICTOS ──────────────────────────────────────────────
-    # Si hay señales BUY y SELL al mismo tiempo → conflicto
-    # Regla: el bando con mayor score DOMINA; el otro se filtra si diff > 10 pts
+    # ── 6. Resolución de conflictos BUY vs SELL ───────────────────────────────
     conflicto_txt = None
     buys  = [s for s in senales if s["dir"] == "buy"]
     sells = [s for s in senales if s["dir"] == "sell"]
     if buys and sells:
         max_buy  = max(s["score"] for s in buys)
         max_sell = max(s["score"] for s in sells)
-        diff = abs(max_buy - max_sell)
+        diff     = abs(max_buy - max_sell)
         if diff >= 10:
-            # Eliminar el bando débil
-            dominant = "sell" if max_sell > max_buy else "buy"
-            senales = [s for s in senales if s["dir"] == dominant]
+            dominant  = "sell" if max_sell > max_buy else "buy"
+            senales   = [s for s in senales if s["dir"] == dominant]
             conflicto_txt = (
-                f"⚡ Señales contradictorias detectadas — "
+                f"⚡ Conflicto detectado — "
                 f"{'VENTA' if dominant=='sell' else 'COMPRA'} domina "
-                f"({max(max_buy,max_sell)}/100 vs {min(max_buy,max_sell)}/100). "
-                f"Señales {'BUY' if dominant=='sell' else 'SELL'} filtradas automáticamente."
+                f"({max(max_buy,max_sell)}/100 vs {min(max_buy,max_sell)}/100)"
             )
         else:
             conflicto_txt = (
-                f"⚠️ Mercado indeciso — señales BUY ({max_buy}/100) y SELL ({max_sell}/100) "
-                f"están demasiado equilibradas. Espera confirmación antes de entrar."
+                f"⚠️ Mercado indeciso — BUY {max_buy}/100 vs SELL {max_sell}/100. "
+                f"Espera confirmación."
             )
-            senales = []  # No operar en indecisión
+            senales = []
 
-    # ── FILTRO POR TIPO ───────────────────────────────────────────────────────
-    if tipo_sel != "🔎 TODOS":
-        senales_filtradas = [s for s in senales if s.get("tipo","") in tipo_sel]
-    else:
-        senales_filtradas = senales
+    senales_filtradas = senales
 
-    # Guardar nuevas señales en historial
+    # Guardar en historial
     for s in senales_filtradas:
         _registrar_senal(s, symbol)
 
-    ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    n_strats = 8 if is_gold else 7
+    ts_str  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    n_strats_map = {"🎯 SCALP": 2, "📅 INTRADAY": 3 + (1 if is_gold else 0),
+                    "📊 SWING": 2, "🔎 TODOS": 7 + (1 if is_gold else 0)}
+    n_strats = n_strats_map.get(tipo_sel, 7)
 
     if conflicto_txt:
-        dom_color = "#ffd600" if (buys and sells and not senales) else ("#00e676" if senales and senales[0]["dir"]=="buy" else "#ff5252")
+        dom_color = ("#ffd600" if (buys and sells and not senales)
+                     else ("#00e676" if senales and senales[0]["dir"]=="buy" else "#ff5252"))
         st.markdown(f"""
         <div style="background:#0d0d20;border:1px solid #2a2a00;border-radius:8px;
              padding:.8rem 1.2rem;margin-bottom:.8rem;font-size:.85em;color:{dom_color}">
@@ -1183,7 +1233,7 @@ def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix)
                     f"✅ {n_sf} señal{'es' if n_sf>1 else ''} · {tipo_sel} · {ts_str}</div>",
                     unsafe_allow_html=True)
         for i, s in enumerate(senales_filtradas):
-            st.markdown(_card(s, n_nivel, n_txt), unsafe_allow_html=True)
+            st.markdown(_card(s, n_nivel, n_txt, decimals), unsafe_allow_html=True)
             key = f"{tab_prefix}_{i}_{s['estrategia'].replace(' ','_')}_{int(s['score'])}"
             if st.button("📋 Copiar señal", key=key):
                 st.session_state[f"show_{key}"] = not st.session_state.get(f"show_{key}", False)
