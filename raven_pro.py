@@ -505,6 +505,7 @@ def _risk(entry, sl, direction, pp=10):
         tp1=entry+s*d*1.5, rr1=1.5, g1=d*1.5*pp,
         tp2=entry+s*d*2.5, rr2=2.5, g2=d*2.5*pp,
         tp3=entry+s*d*4.0, rr3=4.0, g3=d*4.0*pp,
+        tp4=entry+s*d*6.0, rr4=6.0, g4=d*6.0*pp,
         riesgo=d*pp,
     )
 
@@ -513,6 +514,16 @@ def _fmt(v, dec=2):
 
 def _he(s):
     return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+def _entry_type(d, precio, entry):
+    """Detecta si la orden es LIMIT, STOP o MARKET."""
+    if not entry or entry <= 0: return "MARKET"
+    diff = abs(precio - entry) / entry
+    if diff < 0.0005: return "MARKET"
+    if d == "buy":
+        return "LIMIT" if precio > entry else "STOP"
+    else:
+        return "LIMIT" if precio < entry else "STOP"
 
 # ═══════════════════════════════════════════════════════════════════════
 # INDICADORES AUXILIARES (para estrategias)
@@ -1110,129 +1121,167 @@ def _news_risk(ev):
 def _render_card(sig, precio, sym, dec):
     state = sig.get("state","IDEA_EN_FORMACION")
     ic, lbl, col, bg = _SC.get(state, _SC["IDEA_EN_FORMACION"])
-    d    = sig.get("dir","buy")
-    dc   = "#00e676" if d=="buy" else "#ff5252"
-    dt   = "▲ COMPRAR" if d=="buy" else "▼ VENDER"
-    tipo = sig.get("tipo","INTRADAY")
-    score= sig.get("score",0)
+    d      = sig.get("dir","buy")
+    dc     = "#00e676" if d=="buy" else "#ff5252"
+    arrow  = "▲" if d=="buy" else "▼"
+    accion_word = "COMPRA" if d=="buy" else "VENTA"
+    score  = sig.get("score",0)
     sc_lbl, sc_col = _score_label(score)
 
     def f(v): return _fmt(v, dec)
 
     accion = _ACCION.get(state,"")
-    puede_tarde = _PUEDE_ENTRAR_TARDE.get(state,"")
-    prog   = _progreso(sig, precio)
-    prog_p = max(0, min(100, prog*100))
-    bar_c  = dc
 
-    entry = sig.get("entry",0); sl = sig.get("sl",0)
-    tp1   = sig.get("tp1",0);   tp2 = sig.get("tp2",0); tp3 = sig.get("tp3",0)
-    sl_d  = sig.get("sl_d",0);  rr1 = sig.get("rr1",1.5)
-    rr2   = sig.get("rr2",2.5); rr3 = sig.get("rr3",4.0)
-    g1    = sig.get("g1",0);    g2  = sig.get("g2",0); g3  = sig.get("g3",0)
-    riesgo= sig.get("riesgo",0)
-
-    d_entry = abs(precio-entry)
-    d_sl    = abs(precio-sl)
-    d_tp1   = abs(precio-tp1)
-
-    tipo_razon = _he(sig.get("tipo_razon",""))
+    entry  = sig.get("entry",0);   sl   = sig.get("sl",0)
+    tp1    = sig.get("tp1",0);     tp2  = sig.get("tp2",0)
+    tp3    = sig.get("tp3",0);     tp4  = sig.get("tp4",0)
+    sl_d   = sig.get("sl_d",0)
+    rr1    = sig.get("rr1",1.5);   rr2  = sig.get("rr2",2.5)
+    rr3    = sig.get("rr3",4.0);   rr4  = sig.get("rr4",6.0)
     estrategia = _he(sig.get("estrategia",""))
     ctx_txt    = _he(sig.get("ctx",""))
 
-    # Score breakdown
-    sd = sig.get("score_detail",{})
-    comp_names = {"tendencia":"Tendencia","conf_m15":"M15","setup_m5":"Setup",
-                  "momentum":"Momentum","vol_atr":"Volatilidad","entrada_limpia":"Entrada"}
-    comp_max   = {"tendencia":25,"conf_m15":20,"setup_m5":20,"momentum":15,"vol_atr":10,"entrada_limpia":10}
-    pills = ""
-    for k,n in comp_names.items():
-        v=sd.get(k,0); mx=comp_max.get(k,10)
-        pct=v/mx*100 if mx>0 else 0
-        pc="#00e676" if pct>=70 else ("#ffd600" if pct>=40 else "#ff5252")
-        pills += (f'<span style="background:#0a0a14;border:1px solid #1a1a28;border-radius:6px;'
-                  f'padding:2px 7px;font-size:.66em;margin:2px;display:inline-block">'
-                  f'<span style="color:#333">{n}: </span>'
-                  f'<span style="color:{pc};font-weight:700">{v}/{mx}</span></span>')
+    et = _entry_type(d, precio, entry)
+    et_label = f"{accion_word} {et}" if et != "MARKET" else f"{accion_word} AHORA (MARKET)"
 
-    late_html = ""
-    if puede_tarde:
-        late_html = (f'<div style="background:#0e0a00;border-left:3px solid #ff9800;'
-                     f'border-radius:0 6px 6px 0;padding:7px 12px;margin-bottom:8px;'
-                     f'color:#cc7700;font-size:.8em">{_he(puede_tarde)}</div>')
+    # Estrellas de confianza
+    stars = "".join(
+        f'<span style="color:{"#ffd600" if i < score//20 else "#1a1a28"};font-size:1em">★</span>'
+        for i in range(5)
+    )
+
+    # Progreso hacia TP1
+    prog   = _progreso(sig, precio)
+    prog_p = max(0, min(100, prog*100))
+    prog_txt = "zona de entrada ✅" if prog_p<=15 else ("espera retroceso ⏳" if prog_p<=60 else "ya avanzó mucho ⚠️")
+
+    # Distancia en puntos desde entrada
+    def pts(a, b): return abs(a - b)
 
     st.markdown(f"""
-<div style="background:linear-gradient(145deg,{bg},#08080f);
-  border:2px solid {col};border-radius:14px;padding:1.4rem 1.6rem;margin-bottom:.5rem">
+<div style="background:#07070d;border:2px solid {col};border-radius:16px;
+  padding:1.3rem 1.4rem;margin-bottom:.5rem">
 
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+  <!-- ═══ CABECERA ═══ -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <div>
-      <div style="color:{col};font-size:1.4em;font-weight:900">{ic} {lbl}</div>
-      <div style="color:#555;font-size:.85em;margin-top:3px">
-        {_he(sym)} &nbsp;·&nbsp; {tipo} &nbsp;·&nbsp;
-        <span style="color:{dc};font-weight:700">{dt}</span>
-        &nbsp;·&nbsp; <span style="color:#333">{estrategia}</span>
+      <div style="color:#d8d8f8;font-size:1.05em;font-weight:900">{_he(MDEF.get(sym,("","",dec,1,False))[1])}</div>
+      <div style="color:#252540;font-size:.72em;margin-top:1px">{estrategia} &nbsp;·&nbsp; {ctx_txt}</div>
+    </div>
+    <div style="background:{dc}18;border:1.5px solid {dc};border-radius:10px;
+      padding:5px 14px;text-align:center">
+      <div style="color:{dc};font-size:.88em;font-weight:900">{arrow} {et_label}</div>
+    </div>
+  </div>
+
+  <!-- ═══ ESTADO ═══ -->
+  <div style="background:{bg};border-left:4px solid {col};border-radius:0 10px 10px 0;
+    padding:10px 14px;margin-bottom:12px">
+    <div style="color:{col};font-size:1.05em;font-weight:900">{ic}&nbsp; {lbl}</div>
+    <div style="color:#555;font-size:.8em;margin-top:3px">{accion}</div>
+  </div>
+
+  <!-- ═══ ENTRADA Y STOP ═══ -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+
+    <div style="background:#0b0b18;border:2px solid #42a5f5;border-radius:12px;padding:11px 14px">
+      <div style="color:#1a1a38;font-size:.62em;font-weight:700;text-transform:uppercase;
+        letter-spacing:.08em;margin-bottom:3px">📍 PRECIO DE ENTRADA</div>
+      <div style="color:#ffffff;font-size:1.4em;font-weight:900;letter-spacing:.02em">{f(entry)}</div>
+      <div style="color:#333;font-size:.7em;margin-top:2px">
+        Precio actual: <b style="color:#888">{f(precio)}</b>
+        &nbsp;·&nbsp; Dif: {f(pts(precio,entry))}
       </div>
+    </div>
+
+    <div style="background:#0f0507;border:2px solid #ff5252;border-radius:12px;padding:11px 14px">
+      <div style="color:#2a1010;font-size:.62em;font-weight:700;text-transform:uppercase;
+        letter-spacing:.08em;margin-bottom:3px">🛑 STOP LOSS</div>
+      <div style="color:#ff5252;font-size:1.4em;font-weight:900;letter-spacing:.02em">{f(sl)}</div>
+      <div style="color:#2a1010;font-size:.7em;margin-top:2px">
+        Si el precio llega aquí → cierra la operación
+        &nbsp;·&nbsp; <b style="color:#cc3333">-{f(sl_d)} pts</b>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ═══ SEPARADOR OBJETIVOS ═══ -->
+  <div style="text-align:center;color:#1a1a30;font-size:.6em;font-weight:700;
+    letter-spacing:.18em;padding:5px 0 6px 0;text-transform:uppercase">
+    ── Objetivos de ganancia ──
+  </div>
+
+  <!-- ═══ TPs ═══ -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px">
+
+    <div style="background:#060e08;border:1.5px solid #1e4a22;border-radius:10px;padding:9px 12px">
+      <div style="color:#0e2210;font-size:.6em;font-weight:700;text-transform:uppercase;margin-bottom:2px">🎯 TP1 — 1er objetivo</div>
+      <div style="color:#69f0ae;font-size:1.15em;font-weight:900">{f(tp1)}</div>
+      <div style="color:#0e2210;font-size:.68em;margin-top:2px">
+        +{f(pts(tp1,entry))} pts &nbsp;·&nbsp; RR 1:{rr1:.1f}
+      </div>
+    </div>
+
+    <div style="background:#060e08;border:1.5px solid #1e5a28;border-radius:10px;padding:9px 12px">
+      <div style="color:#0e2210;font-size:.6em;font-weight:700;text-transform:uppercase;margin-bottom:2px">🎯 TP2 — 2do objetivo</div>
+      <div style="color:#00e676;font-size:1.15em;font-weight:900">{f(tp2)}</div>
+      <div style="color:#0e2210;font-size:.68em;margin-top:2px">
+        +{f(pts(tp2,entry))} pts &nbsp;·&nbsp; RR 1:{rr2:.1f}
+      </div>
+    </div>
+
+    <div style="background:#070e06;border:1.5px solid #2a5a18;border-radius:10px;padding:9px 12px">
+      <div style="color:#0e220a;font-size:.6em;font-weight:700;text-transform:uppercase;margin-bottom:2px">🎯 TP3 — 3er objetivo</div>
+      <div style="color:#b8e65a;font-size:1.15em;font-weight:900">{f(tp3)}</div>
+      <div style="color:#0e220a;font-size:.68em;margin-top:2px">
+        +{f(pts(tp3,entry))} pts &nbsp;·&nbsp; RR 1:{rr3:.1f}
+      </div>
+    </div>
+
+    <div style="background:#0e0e06;border:1.5px solid #4a4a00;border-radius:10px;padding:9px 12px">
+      <div style="color:#1e1e08;font-size:.6em;font-weight:700;text-transform:uppercase;margin-bottom:2px">🏆 TP4 — objetivo máximo</div>
+      <div style="color:#ffd600;font-size:1.15em;font-weight:900">{f(tp4) if tp4 else "—"}</div>
+      <div style="color:#1e1e08;font-size:.68em;margin-top:2px">
+        {("+"+f(pts(tp4,entry))+" pts · RR 1:"+str(rr4)) if tp4 else "deja correr"}
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ═══ PROGRESO ═══ -->
+  <div style="background:#08080f;border-radius:8px;padding:8px 12px;margin-bottom:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+      <span style="color:#1e1e30;font-size:.65em;font-weight:700;text-transform:uppercase">
+        Avance del precio hacia TP1
+      </span>
+      <span style="color:{dc};font-size:.7em;font-weight:700">{prog_p:.0f}% — {prog_txt}</span>
+    </div>
+    <div style="background:#0e0e18;border-radius:4px;height:6px;overflow:hidden">
+      <div style="background:{dc};height:6px;width:{min(prog_p,100):.0f}%;border-radius:4px;
+        transition:width .3s"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:3px;
+      color:#141428;font-size:.6em">
+      <span>Entrada {f(entry)}</span>
+      <span>TP1 {f(tp1)}</span>
+    </div>
+  </div>
+
+  <!-- ═══ CONFIANZA ═══ -->
+  <div style="display:flex;justify-content:space-between;align-items:center;
+    background:#060610;border:1px solid #0e0e1e;border-radius:8px;padding:7px 12px">
+    <div>
+      <div style="color:#1a1a30;font-size:.62em;text-transform:uppercase;font-weight:700;
+        margin-bottom:3px">Confianza de la señal</div>
+      <div>{stars}</div>
     </div>
     <div style="text-align:right">
-      <div style="color:{sc_col};font-size:2.1em;font-weight:900;line-height:1">{score}</div>
-      <div style="color:#222;font-size:.68em">/100 &nbsp;{sc_lbl}</div>
+      <div style="color:{sc_col};font-size:1.7em;font-weight:900;line-height:1">{score}</div>
+      <div style="color:#1a1a30;font-size:.62em">/100 &nbsp; {sc_lbl}</div>
     </div>
   </div>
 
-  <hr style="border:none;border-top:1px solid #14142a;margin:.4rem 0 .7rem 0">
-
-  <div style="display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:7px;margin-bottom:10px">
-    <div style="background:#0c0c18;border:1px solid #1c1c2e;border-radius:8px;padding:9px 12px">
-      <div style="color:#252535;font-size:.62em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Precio de entrada</div>
-      <div style="color:#fff;font-size:1.05em;font-weight:700">{f(entry)}</div>
-      <div style="color:#333;font-size:.7em;margin-top:1px">Ahora: <span style="color:#888">{f(precio)}</span> &nbsp; Distancia: {f(d_entry)}</div>
-    </div>
-    <div style="background:#120008;border:1px solid #2e0010;border-radius:8px;padding:9px 12px">
-      <div style="color:#252535;font-size:.62em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Stop Loss</div>
-      <div style="color:#ff5252;font-size:1.05em;font-weight:700">{f(sl)}</div>
-      <div style="color:#333;font-size:.7em;margin-top:1px">Riesgo: {f(sl_d)} pts &nbsp;·&nbsp; <span style="color:#cc3333">${riesgo:.0f}/lot</span></div>
-    </div>
-    <div style="background:#081408;border:1px solid #182818;border-radius:8px;padding:9px 12px">
-      <div style="color:#252535;font-size:.62em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Objetivos (relación riesgo/beneficio)</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">
-        <span style="color:#69f0ae;font-size:.82em;font-weight:700">TP1 {f(tp1)} <span style="color:#333;font-size:.75em">·1:{rr1:.1f}</span> <span style="color:#1a4a2a;font-size:.72em">${g1:.0f}</span></span>
-        <span style="color:#00e676;font-size:.82em;font-weight:700">TP2 {f(tp2)} <span style="color:#333;font-size:.75em">·1:{rr2:.1f}</span> <span style="color:#1a4a2a;font-size:.72em">${g2:.0f}</span></span>
-        <span style="color:#ffd600;font-size:.82em;font-weight:700">TP3 {f(tp3)} <span style="color:#333;font-size:.75em">·1:{rr3:.1f}</span> <span style="color:#3a3a00;font-size:.72em">${g3:.0f}</span></span>
-      </div>
-    </div>
-  </div>
-
-  <div style="background:#0a0a14;border-left:3px solid {col};border-radius:0 8px 8px 0;
-    padding:9px 13px;margin-bottom:8px">
-    <div style="color:{col};font-size:.72em;font-weight:700;text-transform:uppercase;
-      letter-spacing:.06em;margin-bottom:2px">¿Qué hago ahora?</div>
-    <div style="color:#bbb;font-size:.88em">{accion}</div>
-  </div>
-
-  {late_html}
-
-  <div style="margin-bottom:9px">
-    <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-      <span style="color:#252535;font-size:.68em">Avance hacia TP1</span>
-      <span style="color:{bar_c};font-size:.74em;font-weight:700">{prog_p:.0f}%
-        {"— zona de entrada" if prog_p<=15 else ("— ESPERA RETROCESO" if prog_p<=60 else "— TARDE")}</span>
-    </div>
-    <div style="background:#0e0e1a;border-radius:4px;height:5px;overflow:hidden">
-      <div style="background:{bar_c};height:5px;width:{min(prog_p,100):.0f}%;border-radius:4px"></div>
-    </div>
-    <div style="display:flex;justify-content:space-between;margin-top:2px;color:#1e1e30;font-size:.63em">
-      <span>Entrada {f(entry)}</span><span>TP1 {f(tp1)}</span>
-    </div>
-  </div>
-
-  <div style="background:#080812;border:1px solid #12122a;border-radius:7px;padding:7px 11px;margin-bottom:7px">
-    <div style="color:#252535;font-size:.66em;font-weight:700;text-transform:uppercase;margin-bottom:2px">¿Por qué {tipo}?</div>
-    <div style="color:#444;font-size:.78em">{tipo_razon}</div>
-    <div style="color:#252535;font-size:.72em;margin-top:3px">{ctx_txt}</div>
-  </div>
-
-  <div style="margin-top:5px">{pills}</div>
 </div>""", unsafe_allow_html=True)
 
 
@@ -1254,40 +1303,53 @@ def _render_mtf(ctx_mtf):
 
 
 def _render_no_trade(sym, razones, ctx_mtf, score_max):
-    h1lbl  = ctx_mtf.get("H1",{}).get("label","?")
-    m15lbl = ctx_mtf.get("M15",{}).get("label","?")
-    bar_c  = "#ff5252" if score_max<70 else "#ffd600"
-    razones_html = "".join(
-        f'<div style="color:#333;font-size:.8em;padding:3px 0;border-bottom:1px solid #0e0e18">'
-        f'<span style="color:#1e1e30">▸ </span>{_he(r)}</div>'
-        for r in razones
-    )
+    bar_c = "#00e676" if score_max>=80 else ("#ffd600" if score_max>=60 else "#ff5252")
+    emoji = "🔥" if score_max>=80 else ("👀" if score_max>=60 else "🔍")
+    razon_principal = _he(razones[0]) if razones else "Buscando setup perfecto..."
+
+    # Nivel de fuerza visual
+    nivel = "CASI LISTO" if score_max>=75 else ("OBSERVANDO" if score_max>=55 else "ESPERANDO")
+    nivel_c = "#ffd600" if score_max>=75 else ("#42a5f5" if score_max>=55 else "#333")
+
     st.markdown(f"""
-<div style="background:#08080f;border:1px solid #141422;border-radius:12px;
-  padding:1.2rem 1.6rem;margin-bottom:.5rem">
+<div style="background:#07070d;border:1px solid #12122a;border-radius:14px;
+  padding:1.1rem 1.3rem;margin-bottom:.5rem">
+
+  <!-- CABECERA -->
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <div>
-      <div style="color:#ff5252;font-size:1.2em;font-weight:900">🔍 SIN SEÑAL · {_he(sym)}</div>
-      <div style="color:#252540;font-size:.8em;margin-top:2px">El scanner sigue buscando el mejor momento</div>
+      <div style="color:#888;font-size:.95em;font-weight:700">{emoji} SIN SEÑAL AHORA</div>
+      <div style="color:#1e1e30;font-size:.75em;margin-top:2px">
+        El scanner está buscando el momento perfecto
+      </div>
     </div>
-    <div style="text-align:right">
-      <div style="color:{bar_c};font-size:1.7em;font-weight:900">{score_max}</div>
-      <div style="color:#1e1e30;font-size:.66em">/100 ahora</div>
+    <div style="text-align:center;background:#08080f;border:1px solid #12122a;
+      border-radius:10px;padding:6px 14px">
+      <div style="color:{bar_c};font-size:1.5em;font-weight:900;line-height:1">{score_max}</div>
+      <div style="color:#1a1a30;font-size:.6em">/100</div>
+      <div style="color:{nivel_c};font-size:.6em;font-weight:700">{nivel}</div>
     </div>
   </div>
-  <div style="background:#0e0e18;border-radius:4px;height:4px;margin-bottom:3px;overflow:hidden">
-    <div style="background:{bar_c};height:4px;width:{min(score_max,100)}%;border-radius:4px"></div>
+
+  <!-- BARRA DE PROGRESO -->
+  <div style="background:#0a0a14;border-radius:4px;height:5px;margin-bottom:10px;overflow:hidden">
+    <div style="background:{bar_c};height:5px;width:{min(score_max,100)}%;border-radius:4px"></div>
   </div>
-  <div style="color:#1a1a2e;font-size:.66em;margin-bottom:10px">
-    Mínimo para mostrar señal: {MIN_SCORE_SHOW}/100 &nbsp;·&nbsp; Para entrar: {MIN_SCORE_ENTRY}/100
+
+  <!-- RAZÓN PRINCIPAL (simple) -->
+  <div style="background:#0a0a14;border-left:3px solid #1e1e38;border-radius:0 8px 8px 0;
+    padding:8px 12px;margin-bottom:8px">
+    <div style="color:#1e1e38;font-size:.62em;font-weight:700;text-transform:uppercase;margin-bottom:2px">
+      ¿Por qué no hay señal?
+    </div>
+    <div style="color:#444;font-size:.82em">{razon_principal}</div>
   </div>
-  <div style="margin-bottom:8px">
-    <div style="color:#1e1e30;font-size:.68em;font-weight:700;text-transform:uppercase;
-      letter-spacing:.07em;margin-bottom:4px">¿Por qué no hay trade ahora?</div>
-    {razones_html}
-  </div>
-  <div style="color:#1a1a2e;font-size:.7em;margin-top:6px">
-    H1: {h1lbl} &nbsp;·&nbsp; M15: {m15lbl}
+
+  <!-- RAZONES ADICIONALES (colapsadas) -->
+  {"".join(f'<div style="color:#252535;font-size:.72em;padding:2px 0">▸ {_he(r)}</div>' for r in razones[1:3])}
+
+  <div style="color:#1a1a28;font-size:.65em;margin-top:6px;text-align:right">
+    Necesitas {MIN_SCORE_ENTRY}/100 para entrada &nbsp;·&nbsp; Ahora: {score_max}/100
   </div>
 </div>""", unsafe_allow_html=True)
 
