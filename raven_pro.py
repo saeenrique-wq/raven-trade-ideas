@@ -308,9 +308,10 @@ def _get_bars(yticker, tf_key, n=300):
     if df is None or len(df) < 20:
         return None
     if tf_key == "H4":
-        df = df.resample("4h").agg(
-            open="first",high="max",low="min",close="last",volume="sum"
-        ).dropna()
+        agg_cols = {c: ("first" if c=="open" else "max" if c=="high" else
+                        "min" if c=="low" else "last" if c=="close" else "sum")
+                    for c in ["open","high","low","close","volume"] if c in df.columns}
+        df = df.resample("4h").agg(agg_cols).dropna()
     return df.tail(n) if df is not None and len(df) > 0 else None
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -404,11 +405,16 @@ def _fetch_all(sym_key):
         return None, None, None, None, None
 
     # Barras
+    def _pick(mt5_df, yf_df):
+        if mt5_df is not None and len(mt5_df) >= 20:
+            return mt5_df
+        return yf_df
+
     if mt5_sym:
-        df_m5  = _mt5_bars(mt5_sym,"M5")  or _get_bars(yft,"M5")
-        df_m15 = _mt5_bars(mt5_sym,"M15") or _get_bars(yft,"M15")
-        df_h1  = _mt5_bars(mt5_sym,"H1")  or _get_bars(yft,"H1")
-        df_h4  = _mt5_bars(mt5_sym,"H4")  or _get_bars(yft,"H4")
+        df_m5  = _pick(_mt5_bars(mt5_sym,"M5"),  _get_bars(yft,"M5"))
+        df_m15 = _pick(_mt5_bars(mt5_sym,"M15"), _get_bars(yft,"M15"))
+        df_h1  = _pick(_mt5_bars(mt5_sym,"H1"),  _get_bars(yft,"H1"))
+        df_h4  = _pick(_mt5_bars(mt5_sym,"H4"),  _get_bars(yft,"H4"))
     else:
         df_m5  = _get_bars(yft,"M5")
         df_m15 = _get_bars(yft,"M15")
@@ -735,7 +741,7 @@ def strat_scalp_ema(df_m5, df_m15, df_h1, precio):
     if not cb and not cs: return None
     if cb and e20h1>e50h1 and 48<=rm<=72:
         sl=e21.iloc[-1]-at5*1.2
-        if abs(precio-sl)<2: return None
+        if abs(precio-sl) < at5*0.3: return None
         r=_risk(precio,sl,"buy")
         if r is None: return None
         sc=66+(7 if rm>55 else 0)+(5 if rh1>50 else 0)
@@ -744,7 +750,7 @@ def strat_scalp_ema(df_m5, df_m15, df_h1, precio):
                     ctx=f"EMA9/21 M5 ↑ RSI M15:{rm:.0f}",**r)
     if cs and e20h1<e50h1 and 28<=rm<=52:
         sl=e21.iloc[-1]+at5*1.2
-        if abs(precio-sl)<2: return None
+        if abs(precio-sl) < at5*0.3: return None
         r=_risk(precio,sl,"sell")
         if r is None: return None
         sc=66+(7 if rm<45 else 0)+(5 if rh1<50 else 0)
@@ -763,7 +769,7 @@ def strat_momentum_m15(df_m15, df_h1, precio):
     if rng<at15*1.3 or body<rng*0.65: return None
     if c>o and e20h1>e50h1 and 50<rm<80 and precio<=c+body*0.3:
         sl=l-at15*0.3
-        if abs(precio-sl)<3: return None
+        if abs(precio-sl) < at15*0.2: return None
         r=_risk(precio,sl,"buy")
         if r is None: return None
         sc=68+(7 if rm>60 else 0)+(5 if body>rng*0.8 else 0)
@@ -772,7 +778,7 @@ def strat_momentum_m15(df_m15, df_h1, precio):
                     ctx=f"Vela M15 alcista {body:.2f}pts RSI:{rm:.0f}",**r)
     if c<o and e20h1<e50h1 and 20<rm<50 and precio>=c-body*0.3:
         sl=h+at15*0.3
-        if abs(precio-sl)<3: return None
+        if abs(precio-sl) < at15*0.2: return None
         r=_risk(precio,sl,"sell")
         if r is None: return None
         sc=68+(7 if rm<40 else 0)+(5 if body>rng*0.8 else 0)
@@ -975,17 +981,21 @@ def _analyze_asset(sym_key, pen):
 
         necesita_nueva = (sig_act is None or sig_act.get("state") in _CLOSED) and not en_cd
 
-        # Candidatos de estrategias
-        d1_df = None  # D1 no siempre disponible vía Yahoo en estos TFs
+        # Candidatos de estrategias (cada una en try/except para no bloquear las demás)
+        d1_df = None
+        def _try(fn, *args):
+            try: return fn(*args)
+            except Exception: return None
+
         candidatos = [
-            strat_london_breakout(df_h1, precio, is_gold),
-            strat_trend_pullback(d1_df, df_h4, df_h1, df_m15, precio),
-            strat_ema_momentum(df_h1, df_m15, precio),
-            strat_supply_demand(df_h4, df_h1, precio),
-            strat_bb_squeeze(df_h1, precio),
-            strat_precio_accion(df_h1, precio),
-            strat_scalp_ema(df_m5, df_m15, df_h1, precio),
-            strat_momentum_m15(df_m15, df_h1, precio),
+            _try(strat_london_breakout, df_h1, precio, is_gold),
+            _try(strat_trend_pullback, d1_df, df_h4, df_h1, df_m15, precio),
+            _try(strat_ema_momentum, df_h1, df_m15, precio),
+            _try(strat_supply_demand, df_h4, df_h1, precio),
+            _try(strat_bb_squeeze, df_h1, precio),
+            _try(strat_precio_accion, df_h1, precio),
+            _try(strat_scalp_ema, df_m5, df_m15, df_h1, precio),
+            _try(strat_momentum_m15, df_m15, df_h1, precio),
         ]
 
         # Score máximo posible (para panel no-trade)
@@ -1342,11 +1352,14 @@ def _render_asset(sym_key, n_nivel, n_txt, pen):
         ast, ctx_mtf, precio, meta = _analyze_asset(sym_key, pen)
 
     if ast is None:
-        if meta and "error" in meta:
-            st.error(f"Error en {sym_key}")
-            st.code(meta["error"], language="python")
-        else:
-            st.warning(f"Sin datos para {sym_key} — verifica conexión.")
+        st.markdown(f"""
+<div style="background:#08080e;border:1px solid #181828;border-radius:10px;
+  padding:.8rem 1.2rem;margin-bottom:.5rem">
+  <div style="color:#ff9800;font-size:.88em;font-weight:700">⚠️ {_he(sym_key)} — Sin datos ahora</div>
+  <div style="color:#2a2a3a;font-size:.75em;margin-top:3px">
+    No se pudo obtener información. El scanner reintenta en {REFRESH}s.
+  </div>
+</div>""", unsafe_allow_html=True)
         return
 
     sig = ast.get("signal")
@@ -1443,14 +1456,28 @@ WELTRADE_COLORS = {
 def _render_weltrade_tab(n_nivel, n_txt, pen):
     if not _mt5_init():
         st.markdown("""
-<div style="background:#080810;border:1px solid #ff525222;border-radius:12px;
-  padding:2rem;text-align:center;color:#ff5252;margin-top:1rem">
-  <div style="font-size:1.2em;font-weight:700;margin-bottom:8px">⚡ MT5 no conectado</div>
-  <div style="color:#333;font-size:.85em">
-    Los índices sintéticos Weltrade requieren MetaTrader5.<br>
-    Abre MT5 con tu cuenta Weltrade y vuelve a cargar el scanner.
+<div style="background:#0a0814;border:1px solid #1a1230;border-radius:10px;
+  padding:.8rem 1.2rem;margin-bottom:.8rem">
+  <div style="color:#ffd600;font-size:.85em;font-weight:700;margin-bottom:3px">
+    ⚡ MT5 no conectado — mostrando instrumentos estándar Weltrade
+  </div>
+  <div style="color:#252535;font-size:.73em">
+    Los índices sintéticos (GainX, PainX, etc.) requieren MT5.
+    Abre MetaTrader5 con tu cuenta Weltrade y recarga el scanner para activarlos.
   </div>
 </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div style="color:#1a1a30;font-size:.65em;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px">Instrumentos estándar disponibles en Weltrade</div>', unsafe_allow_html=True)
+        wt_syms = ["XAUUSD","EURUSD","GBPUSD","USDJPY","US30","US100"]
+        c1, c2 = st.columns(2)
+        for i, sym in enumerate(wt_syms):
+            with (c1 if i % 2 == 0 else c2):
+                try:
+                    lbl = MDEF[sym][1]
+                    st.markdown(f"#### {lbl}")
+                    _render_asset(sym, n_nivel, n_txt, pen)
+                except Exception as ex:
+                    st.warning(f"{sym}: sin datos")
         return
 
     # Radar de activos Weltrade
