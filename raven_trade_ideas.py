@@ -6,6 +6,12 @@ import requests
 from datetime import datetime, timezone
 import time
 
+try:
+    import yfinance as yf
+    _YF_OK = True
+except ImportError:
+    _YF_OK = False
+
 st.set_page_config(page_title="RAVEN TRADE IDEAS · Oro & DJ30", page_icon="🥇",
                    layout="wide", initial_sidebar_state="collapsed")
 
@@ -36,6 +42,31 @@ SYMBOL    = "XAUUSD"
 MIN_SCORE = 62
 REFRESH   = 60
 
+# Mapeo símbolo MT5 → ticker Yahoo Finance
+YAHOO_MAP = {
+    # Oro
+    "xauusd": "GC=F", "xauusdm": "GC=F", "xauusdc": "GC=F",
+    "xauusd+": "GC=F", "xauusd.": "GC=F", "gold": "GC=F",
+    "xau/usd": "GC=F", "xauusdz": "GC=F", "xauusdi": "GC=F",
+    # DJ30
+    "us30": "^DJI", "dj30": "^DJI", "djia": "^DJI",
+    "us30cash": "^DJI", "dj30cash": "^DJI", "wallst30": "^DJI",
+    "wallstreet30": "^DJI", "us30m": "^DJI", "dji": "^DJI", "dow30": "^DJI",
+}
+
+def _yahoo_ticker(symbol):
+    """Retorna el ticker de Yahoo Finance para un símbolo MT5."""
+    key = symbol.lower().replace(" ", "").replace("/", "")
+    # Búsqueda exacta
+    if key in YAHOO_MAP:
+        return YAHOO_MAP[key]
+    # Búsqueda parcial (xauusd... → GC=F)
+    if "xau" in key or "gold" in key:
+        return "GC=F"
+    if "us30" in key or "dj30" in key or "djia" in key or "dow" in key:
+        return "^DJI"
+    return None
+
 def _clase(score):
     if score >= 90: return "ÉLITE",    "#ffd600", "⭐⭐⭐⭐⭐"
     if score >= 80: return "FUERTE",   "#00e676", "⭐⭐⭐⭐"
@@ -49,30 +80,111 @@ def _sesion():
     elif h < 17: return "🇺🇸 NUEVA YORK",  "#ff9800"
     else:        return "🌙 CERRADO",     "#666"
 
-# ─── MT5 ─────────────────────────────────────────────────────────────────────
+# ─── PROVEEDOR DE DATOS (MT5 primario · Yahoo Finance fallback) ───────────────
 @st.cache_resource
-def _init_mt5():
-    if mt5.initialize():
-        return True
-    # Segundo intento sin path (usa MT5 instalado por defecto)
-    return mt5.initialize()
+def _mt5_ok():
+    try:
+        return mt5.initialize()
+    except Exception:
+        return False
 
-def _enable(symbol):
-    """Activa el símbolo en Market Watch y espera precio"""
-    mt5.symbol_select(symbol, True)
-    time.sleep(0.3)
-
-def _bars(tf, n=400):
-    rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, n)
-    if rates is None or len(rates) == 0:
+# ── Yahoo Finance ──────────────────────────────────────────────────────────────
+@st.cache_data(ttl=30, show_spinner=False)
+def _yahoo_price_cached(yticker):
+    if not _YF_OK:
         return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    return df.set_index("time")
+    try:
+        t = yf.Ticker(yticker)
+        p = t.fast_info.last_price
+        if p and float(p) > 0:
+            return float(p)
+    except Exception:
+        pass
+    try:
+        df = yf.Ticker(yticker).history(period="1d", interval="1m")
+        if not df.empty:
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
 
-def _precio():
-    t = mt5.symbol_info_tick(SYMBOL)
-    return (t.bid + t.ask) / 2 if t else None
+@st.cache_data(ttl=180, show_spinner=False)
+def _yahoo_bars_cached(yticker, interval, n):
+    if not _YF_OK:
+        return None
+    period_map = {"15m": "5d", "1h": "60d", "1d": "2y"}
+    try:
+        df = yf.Ticker(yticker).history(
+            period=period_map.get(interval, "60d"),
+            interval=interval,
+        )
+        if df.empty:
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        # Normalizar columnas
+        for col in ["open", "high", "low", "close"]:
+            if col not in df.columns:
+                return None
+        if "volume" not in df.columns:
+            df["volume"] = 0
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df[["open","high","low","close","volume"]].tail(n)
+    except Exception:
+        return None
+
+def _yahoo_bars_h4(yticker, n=200):
+    df = _yahoo_bars_cached(yticker, "1h", 800)
+    if df is None:
+        return None
+    df4 = df.resample("4h").agg(
+        open="first", high="max", low="min", close="last", volume="sum"
+    ).dropna()
+    return df4.tail(n)
+
+# ── API unificada ──────────────────────────────────────────────────────────────
+_TF_TO_YF = {
+    mt5.TIMEFRAME_M15: "15m",
+    mt5.TIMEFRAME_H1:  "1h",
+    mt5.TIMEFRAME_D1:  "1d",
+}
+
+def _get_price(symbol):
+    """Precio actual: MT5 → Yahoo → None"""
+    if _mt5_ok():
+        mt5.symbol_select(symbol, True)
+        time.sleep(0.2)
+        for _ in range(3):
+            t = mt5.symbol_info_tick(symbol)
+            if t and t.bid > 0:
+                return (t.bid + t.ask) / 2, "MT5"
+            time.sleep(0.4)
+    yt = _yahoo_ticker(symbol)
+    if yt:
+        p = _yahoo_price_cached(yt)
+        if p:
+            return p, "Yahoo"
+    return None, None
+
+def _get_bars(symbol, tf, n=400):
+    """Barras OHLCV: MT5 → Yahoo → None"""
+    if _mt5_ok():
+        mt5.symbol_select(symbol, True)
+        rates = mt5.copy_rates_from_pos(symbol, tf, 0, n)
+        if rates is not None and len(rates) > 10:
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            return df.set_index("time"), "MT5"
+    yt = _yahoo_ticker(symbol)
+    if not yt:
+        return None, None
+    if tf == mt5.TIMEFRAME_H4:
+        df = _yahoo_bars_h4(yt, n)
+    else:
+        yf_int = _TF_TO_YF.get(tf, "1h")
+        df = _yahoo_bars_cached(yt, yf_int, n)
+    if df is not None:
+        return df, "Yahoo"
+    return None, None
 
 # ─── NOTICIAS (ForexFactory) ──────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -169,23 +281,15 @@ DJ30_NAMES = [
     "WallSt30", "WallStreet30", "US30m", "DJI", "Dow30",
 ]
 
-def _find_sym(names):
-    """
-    Busca el primer símbolo disponible: primero en la lista explícita,
-    luego busca por substring en todos los símbolos de la cuenta.
-    """
-    # 1. Lista explícita
+def _find_sym_mt5(names):
     for name in names:
-        info = mt5.symbol_info(name)
-        if info is None:
+        if mt5.symbol_info(name) is None:
             continue
         mt5.symbol_select(name, True)
         time.sleep(0.3)
         tick = mt5.symbol_info_tick(name)
         if tick and tick.bid > 0:
             return name
-
-    # 2. Búsqueda dinámica: escanear todos los símbolos de la cuenta
     keywords = {n.lower().replace("/","").replace(" ","") for n in names}
     all_syms = mt5.symbols_get()
     if all_syms:
@@ -201,21 +305,36 @@ def _find_sym(names):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _find_xauusd():
-    return _find_sym(XAUUSD_NAMES)
+    if _mt5_ok():
+        sym = _find_sym_mt5(XAUUSD_NAMES)
+        if sym:
+            return sym, "MT5"
+    if _YF_OK and _yahoo_price_cached("GC=F"):
+        return "XAUUSD", "Yahoo"
+    return None, None
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _find_dj30():
-    return _find_sym(DJ30_NAMES)
+    if _mt5_ok():
+        sym = _find_sym_mt5(DJ30_NAMES)
+        if sym:
+            return sym, "MT5"
+    if _YF_OK and _yahoo_price_cached("^DJI"):
+        return "US30", "Yahoo"
+    return None, None
 
-def _pip_val(symbol):
-    """Valor aproximado en USD por punto por lote estándar"""
-    info = mt5.symbol_info(symbol)
-    if info:
-        tv = info.trade_tick_value
-        ts = info.trade_tick_size
-        if ts > 0:
-            return tv / ts  # USD por punto por lote
-    return 10  # fallback oro
+def _pip_val(symbol, provider="MT5"):
+    if provider == "MT5" and _mt5_ok():
+        info = mt5.symbol_info(symbol)
+        if info:
+            tv = info.trade_tick_value
+            ts = info.trade_tick_size
+            if ts > 0:
+                return tv / ts
+    yt = _yahoo_ticker(symbol)
+    if yt == "GC=F":  return 10
+    if yt == "^DJI":  return 1
+    return 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ESTRATEGIAS
@@ -595,54 +714,32 @@ def _texto(s, news_txt):
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-def _bars_sym(symbol, tf, n=400):
-    mt5.symbol_select(symbol, True)
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, n)
-    if rates is None or len(rates) == 0:
-        return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    return df.set_index("time")
+_SRC_BADGE = {
+    "MT5":   '<span style="background:#0a1a40;color:#42a5f5;padding:2px 9px;border-radius:12px;font-size:.72em;font-weight:700">📊 MT5 en vivo</span>',
+    "Yahoo": '<span style="background:#1a1000;color:#ffd600;padding:2px 9px;border-radius:12px;font-size:.72em;font-weight:700">🌐 Yahoo Finance</span>',
+}
 
-def _precio_sym(symbol):
-    mt5.symbol_select(symbol, True)
-    time.sleep(0.2)
-    for _ in range(3):
-        t = mt5.symbol_info_tick(symbol)
-        if t and t.bid > 0:
-            return (t.bid + t.ask) / 2
-        time.sleep(0.5)
-    return None
-
-
-def _render_senales(symbol, n_nivel, n_txt, pen, decimals, tab_prefix):
-    precio = _precio_sym(symbol)
+def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix):
+    precio, src = _get_price(symbol)
     if precio is None:
-        err = mt5.last_error()
-        st.error(f"❌ No se pudo obtener precio de **{symbol}**.")
-        st.markdown(f"""
-        <div style="background:#0d0d20;border:1px solid #1a1a40;border-radius:8px;
-             padding:1rem;margin-top:.5rem;font-size:.85em;color:#666">
-          <b style="color:#aaa">Posibles causas:</b><br>
-          • El símbolo no está disponible en esta cuenta MT5<br>
-          • MT5 no está conectado al servidor del broker<br>
-          • El mercado está cerrado (fin de semana)<br>
-          <br><b style="color:#aaa">Error MT5:</b> {err}
-        </div>""", unsafe_allow_html=True)
+        st.error(f"❌ Sin datos para **{symbol}**. Verifica tu conexión a internet.")
         return
 
     with st.spinner(f"Analizando {symbol}…"):
-        df_m15 = _bars_sym(symbol, mt5.TIMEFRAME_M15, 400)
-        df_h1  = _bars_sym(symbol, mt5.TIMEFRAME_H1,  400)
-        df_h4  = _bars_sym(symbol, mt5.TIMEFRAME_H4,  300)
-        df_d1  = _bars_sym(symbol, mt5.TIMEFRAME_D1,  200)
+        df_m15, _ = _get_bars(symbol, mt5.TIMEFRAME_M15, 400)
+        df_h1,  _ = _get_bars(symbol, mt5.TIMEFRAME_H1,  400)
+        df_h4,  _ = _get_bars(symbol, mt5.TIMEFRAME_H4,  300)
+        df_d1,  _ = _get_bars(symbol, mt5.TIMEFRAME_D1,  200)
 
-    pp = _pip_val(symbol)
+    pp = _pip_val(symbol, src or provider)
 
     at_h1  = _atr(df_h1).iloc[-1]       if df_h1 is not None else 0
     rsi_h1 = _rsi(df_h1.close).iloc[-1] if df_h1 is not None else 50
     e200   = _ema(df_h1.close, 200).iloc[-1] if df_h1 is not None else precio
     tend   = "▲ ALCISTA" if precio > e200 else "▼ BAJISTA"
+
+    badge = _SRC_BADGE.get(src or provider, _SRC_BADGE["Yahoo"])
+    st.markdown(f'<div style="margin-bottom:6px">{badge}</div>', unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"💰 {symbol}", _fmt(precio, decimals))
@@ -653,7 +750,8 @@ def _render_senales(symbol, n_nivel, n_txt, pen, decimals, tab_prefix):
                 unsafe_allow_html=True)
 
     # Estrategias — DJ30 no usa London Breakout (sin sesión asiática relevante)
-    is_gold = symbol == "XAUUSD"
+    yt = _yahoo_ticker(symbol)
+    is_gold = (yt == "GC=F") or ("xau" in symbol.lower())
 
     def r(entry, sl, direction):
         return _risk(entry, sl, direction, pp)
@@ -759,54 +857,44 @@ def main():
             for e in prox)
         st.markdown(f'<div style="margin-bottom:.8rem">{html_ev}</div>', unsafe_allow_html=True)
 
-    # ── MT5 ───────────────────────────────────────────────────────────────────
-    if not _init_mt5():
-        st.error("❌ No se pudo conectar a MetaTrader 5.")
-        st.markdown("""
-        <div style="background:#0d0d20;border:1px solid #1a1a40;border-radius:8px;
-             padding:1rem;font-size:.85em;color:#666">
-          <b style="color:#aaa">¿Qué hacer?</b><br>
-          1. Abre MetaTrader 5 e inicia sesión en tu cuenta<br>
-          2. Verifica que estés conectado al servidor del broker<br>
-          3. Vuelve a abrir esta aplicación
-        </div>""", unsafe_allow_html=True)
-        return
+    # MT5 intentar silenciosamente — si no está, usamos Yahoo Finance
+    _mt5_ok()
 
-    # Buscar símbolos con auto-detección
-    with st.spinner("Detectando símbolos disponibles…"):
-        xau_sym  = _find_xauusd()
-        dj30_sym = _find_dj30()
+    # Buscar símbolos — MT5 si está abierto, Yahoo Finance si no
+    with st.spinner("Detectando fuente de datos…"):
+        xau_sym,  xau_prov  = _find_xauusd()
+        dj30_sym, dj30_prov = _find_dj30()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    oro_label  = f"🥇 {xau_sym} · ORO"   if xau_sym  else "🥇 XAUUSD (no disponible)"
-    dj30_label = f"📈 {dj30_sym} · DJ30" if dj30_sym else "📈 DJ30 (no disponible)"
+    oro_label  = f"🥇 {xau_sym}  · ORO"  if xau_sym  else "🥇 ORO (sin datos)"
+    dj30_label = f"📈 {dj30_sym} · DJ30" if dj30_sym else "📈 DJ30 (sin datos)"
     tabs = st.tabs([oro_label, dj30_label])
 
     with tabs[0]:
         if xau_sym:
-            _render_senales(xau_sym, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+            _render_senales(xau_sym, xau_prov, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
         else:
-            st.markdown(f"""
+            st.markdown("""
             <div class="no-signal">
-              <div style="font-size:2em;margin-bottom:6px">🔍</div>
-              <div style="color:#555;font-weight:700">XAUUSD no encontrado en esta cuenta MT5</div>
-              <div style="color:#333;font-size:.82em;margin-top:8px">
-                Nombres buscados: {', '.join(XAUUSD_NAMES)}<br><br>
-                ¿Tu broker usa otro nombre para el Oro? Escríbelo exactamente como aparece en MT5.
+              <div style="font-size:2em;margin-bottom:8px">⚠️</div>
+              <div style="color:#aaa;font-weight:700">No hay datos para el Oro</div>
+              <div style="color:#444;font-size:.85em;margin-top:8px">
+                • Abre MT5 con tu cuenta para datos en tiempo real<br>
+                • O verifica tu conexión a internet (Yahoo Finance como fallback)
               </div>
             </div>""", unsafe_allow_html=True)
 
     with tabs[1]:
         if dj30_sym:
-            _render_senales(dj30_sym, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
+            _render_senales(dj30_sym, dj30_prov, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
         else:
-            st.markdown(f"""
+            st.markdown("""
             <div class="no-signal">
-              <div style="font-size:2em;margin-bottom:6px">📈</div>
-              <div style="color:#555;font-weight:700">DJ30 no encontrado en esta cuenta MT5</div>
-              <div style="color:#333;font-size:.82em;margin-top:8px">
-                Nombres buscados: {', '.join(DJ30_NAMES)}<br><br>
-                ¿Cómo se llama el Dow Jones en tu broker? Verifica en el Market Watch de MT5.
+              <div style="font-size:2em;margin-bottom:8px">⚠️</div>
+              <div style="color:#aaa;font-weight:700">No hay datos para DJ30</div>
+              <div style="color:#444;font-size:.85em;margin-top:8px">
+                • Abre MT5 con tu cuenta para datos en tiempo real<br>
+                • O verifica tu conexión a internet (Yahoo Finance como fallback)
               </div>
             </div>""", unsafe_allow_html=True)
 
