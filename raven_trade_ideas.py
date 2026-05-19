@@ -3,12 +3,14 @@
 # Una señal por activo. Seguimiento completo. Sin ruido.
 
 import streamlit as st
+import streamlit.components.v1 as _stc
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import requests
 import json
 import os as _os
+import traceback
 from datetime import datetime, timezone, timedelta
 import time
 
@@ -589,7 +591,7 @@ def _score_pro(sig, df_m1, df_m5, df_m15, df_h1, df_h4, precio):
     pts["vol_atr"] = volp  # max 10
 
     # 7. Entrada limpia — 10 pts
-    entry=sig["entry"]; tp1=sig["tp1"]; dist=abs(tp1-entry)
+    entry=sig.get("entry",precio); tp1=sig.get("tp1",precio); dist=abs(tp1-entry)
     if dist > 0:
         prog = (precio-entry)/dist if d=="buy" else (entry-precio)/dist
         if   prog <= 0.05: cleanp = 10
@@ -669,14 +671,15 @@ def _razones_no_trade(ctx, score_max, df_m5, df_h1):
 # MÁQUINA DE ESTADOS
 # ═══════════════════════════════════════════════════════════════════════════════
 def _progreso(sig, precio):
-    e=sig["entry"]; tp1=sig["tp1"]; dist=abs(tp1-e)
+    e=sig.get("entry",0); tp1=sig.get("tp1",0); dist=abs(tp1-e)
     if dist<=0: return 0
-    return ((precio-e)/dist) if sig["dir"]=="buy" else ((e-precio)/dist)
+    return ((precio-e)/dist) if sig.get("dir","buy")=="buy" else ((e-precio)/dist)
 
 def _transition(sig, precio, df_h1, df_m15):
     state=sig.get("state","IDEA_EN_FORMACION")
-    d=sig["dir"]; e=sig["entry"]; sl=sig["sl"]
-    tp1=sig["tp1"]; tp2=sig["tp2"]; tp3=sig["tp3"]
+    d=sig.get("dir","buy"); e=sig.get("entry",0); sl=sig.get("sl",0)
+    tp1=sig.get("tp1",0); tp2=sig.get("tp2",0); tp3=sig.get("tp3",0)
+    if not e or not sl or not tp1: return None, None
 
     # TP3
     if (d=="buy" and precio>=tp3) or (d=="sell" and precio<=tp3):
@@ -882,7 +885,7 @@ def _analizar(symbol, provider, pen):
 def _render_card(sig, precio, decimals):
     state = sig.get("state","IDEA_EN_FORMACION")
     cfg   = _SC.get(state, _SC["IDEA_EN_FORMACION"])
-    d     = sig["dir"]
+    d     = sig.get("dir","buy")
     dc    = "#00e676" if d=="buy" else "#ff5252"
     dt    = "▲ COMPRAR" if d=="buy" else "▼ VENDER"
     tipo  = sig.get("tipo","INTRADAY")
@@ -897,9 +900,9 @@ def _render_card(sig, precio, decimals):
     bar_c  = "#00e676" if d=="buy" else "#ff5252"
 
     # Distancias
-    d_e  = abs(precio - sig["entry"])
-    d_sl = abs(precio - sig["sl"])
-    d_t1 = abs(precio - sig["tp1"])
+    d_e  = abs(precio - sig.get("entry", precio))
+    d_sl = abs(precio - sig.get("sl", precio))
+    d_t1 = abs(precio - sig.get("tp1", precio))
 
     tipo_razon = sig.get("tipo_razon","")
 
@@ -952,15 +955,15 @@ def _render_card(sig, precio, decimals):
     </div>
     <div style="background:#120008;border:1px solid #2e0010;border-radius:8px;padding:10px 14px">
       <div style="color:#333;font-size:.65em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Stop Loss</div>
-      <div style="color:#ff5252;font-size:1.1em;font-weight:700">{f(sig['sl'])}</div>
-      <div style="color:#444;font-size:.72em;margin-top:2px">Riesgo: {f(sig['sl_d'])} pts</div>
+      <div style="color:#ff5252;font-size:1.1em;font-weight:700">{f(sig.get('sl',0))}</div>
+      <div style="color:#444;font-size:.72em;margin-top:2px">Riesgo: {f(sig.get('sl_d',0))} pts</div>
     </div>
     <div style="background:#081408;border:1px solid #182a18;border-radius:8px;padding:10px 14px">
       <div style="color:#333;font-size:.65em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Objetivos (RR)</div>
       <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-        <span style="color:#69f0ae;font-size:.85em;font-weight:700">TP1&nbsp;{f(sig['tp1'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr1']:.1f}</span></span>
-        <span style="color:#00e676;font-size:.85em;font-weight:700">TP2&nbsp;{f(sig['tp2'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr2']:.1f}</span></span>
-        <span style="color:#ffd600;font-size:.85em;font-weight:700">TP3&nbsp;{f(sig['tp3'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr3']:.1f}</span></span>
+        <span style="color:#69f0ae;font-size:.85em;font-weight:700">TP1&nbsp;{f(sig.get('tp1',0))}<span style="color:#333;font-size:.75em"> ·1:{sig.get('rr1',1.5):.1f}</span></span>
+        <span style="color:#00e676;font-size:.85em;font-weight:700">TP2&nbsp;{f(sig.get('tp2',0))}<span style="color:#333;font-size:.75em"> ·1:{sig.get('rr2',2.5):.1f}</span></span>
+        <span style="color:#ffd600;font-size:.85em;font-weight:700">TP3&nbsp;{f(sig.get('tp3',0))}<span style="color:#333;font-size:.75em"> ·1:{sig.get('rr3',4.0):.1f}</span></span>
       </div>
     </div>
   </div>
@@ -985,7 +988,7 @@ def _render_card(sig, precio, decimals):
         border-radius:4px;transition:width .3s"></div>
     </div>
     <div style="display:flex;justify-content:space-between;margin-top:3px;color:#222;font-size:.65em">
-      <span>Entrada {f(sig['entry'])}</span><span>TP1 {f(sig['tp1'])}</span>
+      <span>Entrada {f(sig.get('entry',0))}</span><span>TP1 {f(sig.get('tp1',0))}</span>
     </div>
   </div>
 
@@ -1003,17 +1006,16 @@ def _render_card(sig, precio, decimals):
 
 
 def _render_tracking(sig, precio, decimals):
-    """Panel de seguimiento numérico debajo de la tarjeta."""
-    d=sig["dir"]; state=sig.get("state","")
+    d=sig.get("dir","buy"); state=sig.get("state","")
     def f(v): return _fmt(v, decimals)
     prog_p = max(0, min(100, _progreso(sig, precio)*100))
     bar_c  = "#00e676" if d=="buy" else "#ff5252"
     ts     = sig.get("updated_at","")[:16].replace("T"," ")+" UTC" if sig.get("updated_at") else "—"
 
-    d_entry = abs(precio - sig["entry"])
-    d_sl    = abs(precio - sig["sl"])
-    d_tp1   = abs(precio - sig["tp1"])
-    d_tp2   = abs(precio - sig["tp2"])
+    d_entry = abs(precio - sig.get("entry", precio))
+    d_sl    = abs(precio - sig.get("sl", precio))
+    d_tp1   = abs(precio - sig.get("tp1", precio))
+    d_tp2   = abs(precio - sig.get("tp2", precio))
 
     st.markdown(f"""
 <div style="background:#080810;border:1px solid #141426;border-radius:10px;
@@ -1302,7 +1304,11 @@ def main():
 
     with tab1:
         if xau_sym:
-            _render_activo(xau_sym, xau_prov, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+            try:
+                _render_activo(xau_sym, xau_prov, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+            except Exception as _ex:
+                st.error(f"Error en ORO: {_ex}")
+                st.code(traceback.format_exc(), language="python")
         else:
             st.markdown("""<div style="color:#333;text-align:center;padding:3rem">
               ⚠️ Sin datos para Oro. Abre MT5 o verifica tu conexión.</div>""",
@@ -1310,7 +1316,11 @@ def main():
 
     with tab2:
         if dj30_sym:
-            _render_activo(dj30_sym, dj30_prov, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
+            try:
+                _render_activo(dj30_sym, dj30_prov, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
+            except Exception as _ex:
+                st.error(f"Error en DJ30: {_ex}")
+                st.code(traceback.format_exc(), language="python")
         else:
             st.markdown("""<div style="color:#333;text-align:center;padding:3rem">
               ⚠️ Sin datos para DJ30. Abre MT5 o verifica tu conexión.</div>""",
@@ -1322,8 +1332,11 @@ def main():
   RAVEN TRADE IDEAS · Solo educativo · Gestiona siempre tu riesgo
 </div>""", unsafe_allow_html=True)
 
-    time.sleep(REFRESH)
-    st.rerun()
+    # Auto-refresh sin bloquear la UI (reemplaza time.sleep + st.rerun)
+    _stc.html(
+        f'<script>setTimeout(function(){{window.parent.location.reload();}},{REFRESH*1000});</script>',
+        height=0
+    )
 
 if __name__ == "__main__":
     main()
