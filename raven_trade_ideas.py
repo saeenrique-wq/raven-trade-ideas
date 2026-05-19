@@ -52,7 +52,15 @@ def _sesion():
 # ─── MT5 ─────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def _init_mt5():
+    if mt5.initialize():
+        return True
+    # Segundo intento sin path (usa MT5 instalado por defecto)
     return mt5.initialize()
+
+def _enable(symbol):
+    """Activa el símbolo en Market Watch y espera precio"""
+    mt5.symbol_select(symbol, True)
+    time.sleep(0.3)
 
 def _bars(tf, n=400):
     rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, n)
@@ -152,15 +160,52 @@ def _risk(entry, sl, direction, pp=10):
 
 def _fmt(v, decimals=2): return f"${v:,.{decimals}f}"
 
-DJ30_NAMES = ["US30", "DJ30", "DJIA", "US30Cash", "DJ30Cash", "WallSt30", "WallStreet30"]
+XAUUSD_NAMES = [
+    "XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSD+", "XAUUSD.",
+    "Gold", "GOLD", "XAU/USD", "XAUUSDz", "XAUUSDi",
+]
+DJ30_NAMES = [
+    "US30", "DJ30", "DJIA", "US30Cash", "DJ30Cash",
+    "WallSt30", "WallStreet30", "US30m", "DJI", "Dow30",
+]
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _find_dj30():
-    for name in DJ30_NAMES:
+def _find_sym(names):
+    """
+    Busca el primer símbolo disponible: primero en la lista explícita,
+    luego busca por substring en todos los símbolos de la cuenta.
+    """
+    # 1. Lista explícita
+    for name in names:
         info = mt5.symbol_info(name)
-        if info is not None:
+        if info is None:
+            continue
+        mt5.symbol_select(name, True)
+        time.sleep(0.3)
+        tick = mt5.symbol_info_tick(name)
+        if tick and tick.bid > 0:
             return name
+
+    # 2. Búsqueda dinámica: escanear todos los símbolos de la cuenta
+    keywords = {n.lower().replace("/","").replace(" ","") for n in names}
+    all_syms = mt5.symbols_get()
+    if all_syms:
+        for s in all_syms:
+            n = s.name.lower().replace("/","").replace(" ","")
+            if any(kw in n or n in kw for kw in keywords):
+                mt5.symbol_select(s.name, True)
+                time.sleep(0.3)
+                tick = mt5.symbol_info_tick(s.name)
+                if tick and tick.bid > 0:
+                    return s.name
     return None
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _find_xauusd():
+    return _find_sym(XAUUSD_NAMES)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _find_dj30():
+    return _find_sym(DJ30_NAMES)
 
 def _pip_val(symbol):
     """Valor aproximado en USD por punto por lote estándar"""
@@ -551,6 +596,7 @@ def _texto(s, news_txt):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def _bars_sym(symbol, tf, n=400):
+    mt5.symbol_select(symbol, True)
     rates = mt5.copy_rates_from_pos(symbol, tf, 0, n)
     if rates is None or len(rates) == 0:
         return None
@@ -559,14 +605,30 @@ def _bars_sym(symbol, tf, n=400):
     return df.set_index("time")
 
 def _precio_sym(symbol):
-    t = mt5.symbol_info_tick(symbol)
-    return (t.bid + t.ask) / 2 if t else None
+    mt5.symbol_select(symbol, True)
+    time.sleep(0.2)
+    for _ in range(3):
+        t = mt5.symbol_info_tick(symbol)
+        if t and t.bid > 0:
+            return (t.bid + t.ask) / 2
+        time.sleep(0.5)
+    return None
 
 
 def _render_senales(symbol, n_nivel, n_txt, pen, decimals, tab_prefix):
     precio = _precio_sym(symbol)
     if precio is None:
-        st.warning(f"⚠️ Sin precio para {symbol}.")
+        err = mt5.last_error()
+        st.error(f"❌ No se pudo obtener precio de **{symbol}**.")
+        st.markdown(f"""
+        <div style="background:#0d0d20;border:1px solid #1a1a40;border-radius:8px;
+             padding:1rem;margin-top:.5rem;font-size:.85em;color:#666">
+          <b style="color:#aaa">Posibles causas:</b><br>
+          • El símbolo no está disponible en esta cuenta MT5<br>
+          • MT5 no está conectado al servidor del broker<br>
+          • El mercado está cerrado (fin de semana)<br>
+          <br><b style="color:#aaa">Error MT5:</b> {err}
+        </div>""", unsafe_allow_html=True)
         return
 
     with st.spinner(f"Analizando {symbol}…"):
@@ -699,21 +761,40 @@ def main():
 
     # ── MT5 ───────────────────────────────────────────────────────────────────
     if not _init_mt5():
-        st.error("❌ No se pudo conectar a MetaTrader 5. Abre MT5 primero.")
+        st.error("❌ No se pudo conectar a MetaTrader 5.")
+        st.markdown("""
+        <div style="background:#0d0d20;border:1px solid #1a1a40;border-radius:8px;
+             padding:1rem;font-size:.85em;color:#666">
+          <b style="color:#aaa">¿Qué hacer?</b><br>
+          1. Abre MetaTrader 5 e inicia sesión en tu cuenta<br>
+          2. Verifica que estés conectado al servidor del broker<br>
+          3. Vuelve a abrir esta aplicación
+        </div>""", unsafe_allow_html=True)
         return
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    dj30_sym = _find_dj30()
-    tab_labels = ["🥇 XAUUSD · ORO"]
-    if dj30_sym:
-        tab_labels.append(f"📈 {dj30_sym} · DJ30")
-    else:
-        tab_labels.append("📈 DJ30 (no disponible)")
+    # Buscar símbolos con auto-detección
+    with st.spinner("Detectando símbolos disponibles…"):
+        xau_sym  = _find_xauusd()
+        dj30_sym = _find_dj30()
 
-    tabs = st.tabs(tab_labels)
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    oro_label  = f"🥇 {xau_sym} · ORO"   if xau_sym  else "🥇 XAUUSD (no disponible)"
+    dj30_label = f"📈 {dj30_sym} · DJ30" if dj30_sym else "📈 DJ30 (no disponible)"
+    tabs = st.tabs([oro_label, dj30_label])
 
     with tabs[0]:
-        _render_senales("XAUUSD", n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+        if xau_sym:
+            _render_senales(xau_sym, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+        else:
+            st.markdown(f"""
+            <div class="no-signal">
+              <div style="font-size:2em;margin-bottom:6px">🔍</div>
+              <div style="color:#555;font-weight:700">XAUUSD no encontrado en esta cuenta MT5</div>
+              <div style="color:#333;font-size:.82em;margin-top:8px">
+                Nombres buscados: {', '.join(XAUUSD_NAMES)}<br><br>
+                ¿Tu broker usa otro nombre para el Oro? Escríbelo exactamente como aparece en MT5.
+              </div>
+            </div>""", unsafe_allow_html=True)
 
     with tabs[1]:
         if dj30_sym:
@@ -721,10 +802,11 @@ def main():
         else:
             st.markdown(f"""
             <div class="no-signal">
-              <div style="font-size:1.8em;margin-bottom:6px">📈</div>
-              <div style="color:#555">DJ30 no encontrado en esta cuenta MT5</div>
-              <div style="color:#333;font-size:.82em;margin-top:6px">
-                Símbolos buscados: {', '.join(DJ30_NAMES)}
+              <div style="font-size:2em;margin-bottom:6px">📈</div>
+              <div style="color:#555;font-weight:700">DJ30 no encontrado en esta cuenta MT5</div>
+              <div style="color:#333;font-size:.82em;margin-top:8px">
+                Nombres buscados: {', '.join(DJ30_NAMES)}<br><br>
+                ¿Cómo se llama el Dow Jones en tu broker? Verifica en el Market Watch de MT5.
               </div>
             </div>""", unsafe_allow_html=True)
 
