@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 BASE  = r"C:\Users\saems"
-APP   = os.path.join(BASE, "raven_trade_ideas.py")
+APP   = os.path.join(BASE, "raven_pro.py")
 CF    = os.path.join(BASE, "cloudflared.exe")
 PORT  = 8507
 
@@ -82,7 +82,7 @@ def cleanup():
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 root = tk.Tk()
-root.title("RAVEN TRADE IDEAS · Oro & DJ30")
+root.title("RAVEN TRADE IDEAS PRO")
 root.geometry("500x310")
 root.configure(bg="#07070f")
 root.resizable(False, False)
@@ -99,9 +99,9 @@ f_status = tkfont.Font(family="Segoe UI", size=10)
 f_url    = tkfont.Font(family="Courier New", size=10, weight="bold")
 f_btn    = tkfont.Font(family="Segoe UI", size=9, weight="bold")
 
-tk.Label(root, text="🥇  RAVEN TRADE IDEAS · Oro & DJ30",
+tk.Label(root, text="🥇  RAVEN TRADE IDEAS PRO",
          bg="#07070f", fg="#ffd600", font=f_title).pack(pady=(22, 3))
-tk.Label(root, text="XAUUSD + DJ30 · 6 estrategias · Anti-noticias en tiempo real",
+tk.Label(root, text="ORO · ÍNDICES · FOREX · MATERIAS · CRYPTO · WELTRADE",
          bg="#07070f", fg="#383858", font=f_sub).pack()
 tk.Frame(root, bg="#1a1a30", height=1).pack(fill="x", padx=30, pady=12)
 
