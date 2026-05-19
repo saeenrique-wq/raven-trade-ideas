@@ -1,9 +1,15 @@
+# raven_trade_ideas.py · v7
+# RAVEN TRADE IDEAS — Asistente profesional
+# Una señal por activo. Seguimiento completo. Sin ruido.
+
 import streamlit as st
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timezone
+import json
+import os as _os
+from datetime import datetime, timezone, timedelta
 import time
 
 try:
@@ -12,1330 +18,1312 @@ try:
 except ImportError:
     _YF_OK = False
 
-st.set_page_config(page_title="RAVEN TRADE IDEAS · Oro & DJ30", page_icon="🥇",
-                   layout="wide", initial_sidebar_state="collapsed")
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+MIN_SCORE_SHOW  = 70    # mínimo para mostrar idea
+MIN_SCORE_ENTRY = 80    # mínimo para ENTRADA_VALIDA
+LATE_PULLBACK   = 0.35  # % avance hacia TP1 → esperar pullback
+LATE_CANCEL     = 0.62  # % avance → cancelar
+COOLDOWN_MIN    = 15    # minutos entre ideas
+STATE_FILE      = r"C:\Users\saems\raven_state.json"
+REFRESH         = 45    # segundos entre actualizaciones automáticas
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PÁGINA + CSS
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="RAVEN TRADE IDEAS", page_icon="🥇",
+                   layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"]{background:#07070f}
+[data-testid="stAppViewContainer"]{background:#06060e}
 [data-testid="stHeader"]{background:transparent}
-.block-container{padding:1.2rem 2rem;max-width:1300px}
-.card-buy{background:linear-gradient(135deg,#001a0d,#002a14);border:1px solid #00c853;
-  border-left:4px solid #00e676;border-radius:10px;padding:1.2rem 1.5rem;margin-bottom:.8rem}
-.card-sell{background:linear-gradient(135deg,#1a0000,#2a0000);border:1px solid #c62828;
-  border-left:4px solid #ff5252;border-radius:10px;padding:1.2rem 1.5rem;margin-bottom:.8rem}
-.news-bar{background:#0d0d1a;border:1px solid #1a1a40;border-radius:8px;
-  padding:.6rem 1.2rem;margin-bottom:1rem;font-size:.88em}
-.badge-safe{background:#00c853;color:#000;padding:2px 10px;border-radius:20px;font-size:.78em;font-weight:700}
-.badge-caution{background:#ff9800;color:#000;padding:2px 10px;border-radius:20px;font-size:.78em;font-weight:700}
-.badge-danger{background:#c62828;color:#fff;padding:2px 10px;border-radius:20px;font-size:.78em;font-weight:700}
-.no-signal{background:#0d0d1a;border:1px dashed #1a1a40;border-radius:10px;
-  padding:2.5rem;text-align:center;color:#444;font-size:1.1em;margin-top:2rem}
-div[data-testid="stButton"]>button{background:#1a1a30;color:#d8d8f8;border:1px solid #333;
+.block-container{padding:.8rem 1.6rem;max-width:1180px}
+div[data-testid="stButton"]>button{background:#12121e;color:#ccc;border:1px solid #252535;
   border-radius:6px;font-size:.82em;padding:4px 14px}
-div[data-testid="stButton"]>button:hover{background:#2a2a50;border-color:#555}
+div[data-testid="stButton"]>button:hover{background:#1e1e32}
+div[data-testid="metric-container"]{background:#0a0a12;border:1px solid #16162a;
+  border-radius:8px;padding:8px 12px}
 </style>
 """, unsafe_allow_html=True)
 
-# ─── CONSTANTES ──────────────────────────────────────────────────────────────
-SYMBOL    = "XAUUSD"
-MIN_SCORE = 62
-REFRESH   = 60
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESTADOS — colores, íconos, acciones
+# ═══════════════════════════════════════════════════════════════════════════════
+_SC = {
+    "BUSCANDO_SETUP":     dict(icon="🔴", label="NO OPERAR",          color="#ff5252", bg="#100008"),
+    "IDEA_EN_FORMACION":  dict(icon="🟡", label="IDEA EN FORMACIÓN",  color="#ffd600", bg="#100e00"),
+    "ESPERANDO_PULLBACK": dict(icon="⏳", label="ESPERAR PULLBACK",   color="#ff9800", bg="#100800"),
+    "ENTRADA_VALIDA":     dict(icon="🟢", label="ENTRADA VÁLIDA",     color="#00e676", bg="#001410"),
+    "EN_OPERACION":       dict(icon="🔵", label="EN OPERACIÓN",       color="#42a5f5", bg="#001020"),
+    "TP1_ALCANZADO":      dict(icon="✅", label="TP1 ALCANZADO",      color="#69f0ae", bg="#001a0c"),
+    "TP2_ALCANZADO":      dict(icon="✅", label="TP2 ALCANZADO",      color="#00e676", bg="#002014"),
+    "TP3_ALCANZADO":      dict(icon="🏆", label="TP3 ALCANZADO",      color="#ffd600", bg="#141000"),
+    "STOP_LOSS":          dict(icon="❌", label="STOP LOSS",          color="#ff5252", bg="#180000"),
+    "INVALIDADA":         dict(icon="⛔", label="SEÑAL INVALIDADA",   color="#ff5252", bg="#120000"),
+    "CANCELAR_IDEA":      dict(icon="🚫", label="CANCELAR IDEA",      color="#ff9800", bg="#100800"),
+}
+_ACCION = {
+    "BUSCANDO_SETUP":     "Sin setup válido. Monitorear mercado.",
+    "IDEA_EN_FORMACION":  "Setup posible — esperar más confirmación antes de entrar.",
+    "ESPERANDO_PULLBACK": "Setup válido pero entrada tardía. Esperar retroceso al nivel de entrada.",
+    "ENTRADA_VALIDA":     "Precio en zona de entrada. Se puede ejecutar la operación.",
+    "EN_OPERACION":       "Trade activo. Gestionar con SL y TPs definidos.",
+    "TP1_ALCANZADO":      "TP1 cumplido. Mover SL a breakeven. Considerar cerrar 30-50%.",
+    "TP2_ALCANZADO":      "TP2 cumplido. Mover SL a TP1. Dejar el resto correr hacia TP3.",
+    "TP3_ALCANZADO":      "Objetivo completo. Cerrar toda la posición.",
+    "STOP_LOSS":          "Idea fallida. No recuperable. Esperar nuevo setup.",
+    "INVALIDADA":         "Estructura cambió. No operar esta idea.",
+    "CANCELAR_IDEA":      "El movimiento ya corrió. Esperar nueva oportunidad.",
+}
+_CLOSED = {"STOP_LOSS", "TP3_ALCANZADO", "INVALIDADA", "CANCELAR_IDEA"}
 
-# Mapeo símbolo MT5 → ticker Yahoo Finance
+# ═══════════════════════════════════════════════════════════════════════════════
+# YAHOO FINANCE — MAPEO
+# ═══════════════════════════════════════════════════════════════════════════════
 YAHOO_MAP = {
-    # Oro
-    "xauusd": "GC=F", "xauusdm": "GC=F", "xauusdc": "GC=F",
-    "xauusd+": "GC=F", "xauusd.": "GC=F", "gold": "GC=F",
-    "xau/usd": "GC=F", "xauusdz": "GC=F", "xauusdi": "GC=F",
-    # DJ30
-    "us30": "^DJI", "dj30": "^DJI", "djia": "^DJI",
-    "us30cash": "^DJI", "dj30cash": "^DJI", "wallst30": "^DJI",
-    "wallstreet30": "^DJI", "us30m": "^DJI", "dji": "^DJI", "dow30": "^DJI",
+    "xauusd":"GC=F","xauusdm":"GC=F","xauusdc":"GC=F","xauusd+":"GC=F",
+    "xauusd.":"GC=F","gold":"GC=F","xau/usd":"GC=F","xauusdz":"GC=F","xauusdi":"GC=F",
+    "us30":"^DJI","dj30":"^DJI","djia":"^DJI","us30cash":"^DJI","dj30cash":"^DJI",
+    "wallst30":"^DJI","wallstreet30":"^DJI","us30m":"^DJI","dji":"^DJI","dow30":"^DJI",
 }
 
-def _yahoo_ticker(symbol):
-    """Retorna el ticker de Yahoo Finance para un símbolo MT5."""
-    key = symbol.lower().replace(" ", "").replace("/", "")
-    # Búsqueda exacta
-    if key in YAHOO_MAP:
-        return YAHOO_MAP[key]
-    # Búsqueda parcial (xauusd... → GC=F)
-    if "xau" in key or "gold" in key:
-        return "GC=F"
-    if "us30" in key or "dj30" in key or "djia" in key or "dow" in key:
-        return "^DJI"
+def _yt(symbol):
+    k = symbol.lower().replace(" ","").replace("/","")
+    if k in YAHOO_MAP: return YAHOO_MAP[k]
+    if "xau" in k or "gold" in k: return "GC=F"
+    if "us30" in k or "dj30" in k or "djia" in k or "dow" in k: return "^DJI"
     return None
 
-def _clase(score):
-    if score >= 90: return "ÉLITE",    "#ffd600", "⭐⭐⭐⭐⭐"
-    if score >= 80: return "FUERTE",   "#00e676", "⭐⭐⭐⭐"
-    if score >= 70: return "BUENA",    "#42a5f5", "⭐⭐⭐"
-    return               "MODERADA",  "#ff9800", "⭐⭐"
+def _is_gold(symbol):
+    return _yt(symbol) == "GC=F" or "xau" in symbol.lower()
 
-def _sesion():
-    h = datetime.now(timezone.utc).hour
-    if   h <  7: return "🌏 ASIÁTICA",    "#42a5f5"
-    elif h < 12: return "🇬🇧 LONDRE S",   "#00e676"
-    elif h < 17: return "🇺🇸 NUEVA YORK",  "#ff9800"
-    else:        return "🌙 CERRADO",     "#666"
-
-# ─── PROVEEDOR DE DATOS (MT5 primario · Yahoo Finance fallback) ───────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATOS — MT5 + Yahoo Finance
+# ═══════════════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def _mt5_ok():
-    try:
-        return mt5.initialize()
-    except Exception:
-        return False
+    try: return mt5.initialize()
+    except: return False
 
-# ── Yahoo Finance ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
-def _yahoo_price_cached(yticker):
-    if not _YF_OK:
-        return None
+@st.cache_data(ttl=25, show_spinner=False)
+def _yf_price(yticker):
+    if not _YF_OK: return None
     try:
-        t = yf.Ticker(yticker)
-        p = t.fast_info.last_price
-        if p and float(p) > 0:
-            return float(p)
-    except Exception:
-        pass
+        p = yf.Ticker(yticker).fast_info.last_price
+        if p and float(p) > 0: return float(p)
+    except: pass
     try:
         df = yf.Ticker(yticker).history(period="1d", interval="1m")
-        if not df.empty:
-            return float(df["Close"].iloc[-1])
-    except Exception:
-        pass
+        if not df.empty: return float(df["Close"].iloc[-1])
+    except: pass
     return None
 
-@st.cache_data(ttl=180, show_spinner=False)
-def _yahoo_bars_cached(yticker, interval, n):
-    if not _YF_OK:
-        return None
-    period_map = {"15m": "5d", "1h": "60d", "1d": "2y"}
+@st.cache_data(ttl=120, show_spinner=False)
+def _yf_bars(yticker, interval, n):
+    if not _YF_OK: return None
+    pm = {"2m":"1d","5m":"5d","15m":"5d","1h":"60d","1d":"2y"}
     try:
-        df = yf.Ticker(yticker).history(
-            period=period_map.get(interval, "60d"),
-            interval=interval,
-        )
-        if df.empty:
-            return None
+        df = yf.Ticker(yticker).history(period=pm.get(interval,"60d"), interval=interval)
+        if df.empty: return None
         df.columns = [c.lower() for c in df.columns]
-        # Normalizar columnas
-        for col in ["open", "high", "low", "close"]:
-            if col not in df.columns:
-                return None
-        if "volume" not in df.columns:
-            df["volume"] = 0
+        for c in ["open","high","low","close"]:
+            if c not in df.columns: return None
+        if "volume" not in df.columns: df["volume"] = 0
         df.index = pd.to_datetime(df.index, utc=True)
         return df[["open","high","low","close","volume"]].tail(n)
-    except Exception:
-        return None
+    except: return None
 
-def _yahoo_bars_h4(yticker, n=200):
-    df = _yahoo_bars_cached(yticker, "1h", 800)
-    if df is None:
-        return None
-    df4 = df.resample("4h").agg(
-        open="first", high="max", low="min", close="last", volume="sum"
-    ).dropna()
-    return df4.tail(n)
+def _yf_h4(yticker, n=200):
+    df = _yf_bars(yticker, "1h", 800)
+    if df is None: return None
+    return df.resample("4h").agg(open="first",high="max",low="min",close="last",volume="sum").dropna().tail(n)
 
-# ── API unificada ──────────────────────────────────────────────────────────────
-_TF_TO_YF = {
-    mt5.TIMEFRAME_M15: "15m",
-    mt5.TIMEFRAME_H1:  "1h",
-    mt5.TIMEFRAME_D1:  "1d",
+_TF_YF = {
+    mt5.TIMEFRAME_M1:"2m", mt5.TIMEFRAME_M5:"5m",
+    mt5.TIMEFRAME_M15:"15m", mt5.TIMEFRAME_H1:"1h", mt5.TIMEFRAME_D1:"1d",
 }
 
-def _get_price(symbol):
-    """Precio actual: MT5 → Yahoo → None"""
+def _price(symbol):
     if _mt5_ok():
-        mt5.symbol_select(symbol, True)
-        time.sleep(0.2)
+        mt5.symbol_select(symbol, True); time.sleep(0.15)
         for _ in range(3):
             t = mt5.symbol_info_tick(symbol)
-            if t and t.bid > 0:
-                return (t.bid + t.ask) / 2, "MT5"
-            time.sleep(0.4)
-    yt = _yahoo_ticker(symbol)
+            if t and t.bid > 0: return (t.bid+t.ask)/2, "MT5"
+            time.sleep(0.3)
+    yt = _yt(symbol)
     if yt:
-        p = _yahoo_price_cached(yt)
-        if p:
-            return p, "Yahoo"
+        p = _yf_price(yt)
+        if p: return p, "Yahoo"
     return None, None
 
-def _get_bars(symbol, tf, n=400):
-    """Barras OHLCV: MT5 → Yahoo → None"""
+def _bars(symbol, tf, n=400):
     if _mt5_ok():
         mt5.symbol_select(symbol, True)
-        rates = mt5.copy_rates_from_pos(symbol, tf, 0, n)
-        if rates is not None and len(rates) > 10:
-            df = pd.DataFrame(rates)
+        r = mt5.copy_rates_from_pos(symbol, tf, 0, n)
+        if r is not None and len(r) > 10:
+            df = pd.DataFrame(r)
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            return df.set_index("time"), "MT5"
-    yt = _yahoo_ticker(symbol)
-    if not yt:
-        return None, None
-    if tf == mt5.TIMEFRAME_H4:
-        df = _yahoo_bars_h4(yt, n)
-    else:
-        yf_int = _TF_TO_YF.get(tf, "1h")
-        df = _yahoo_bars_cached(yt, yf_int, n)
-    if df is not None:
-        return df, "Yahoo"
-    return None, None
+            return df.set_index("time")
+    yt = _yt(symbol)
+    if not yt: return None
+    if tf == mt5.TIMEFRAME_H4: return _yf_h4(yt, n)
+    return _yf_bars(yt, _TF_YF.get(tf,"1h"), n)
 
-# ─── NOTICIAS (ForexFactory) ──────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_news():
-    eventos = []
-    for url in [
-        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-    ]:
-        try:
-            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200:
-                continue
-            for e in r.json():
-                if e.get("impact") == "High" and e.get("country") == "USD":
-                    try:
-                        dt = datetime.fromisoformat(e["date"]).astimezone(timezone.utc)
-                        eventos.append({"dt": dt, "titulo": e.get("title", "")})
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return sorted(eventos, key=lambda x: x["dt"])
+XAUUSD_NAMES = ["XAUUSD","XAUUSDm","XAUUSDc","XAUUSD+","XAUUSD.","Gold","GOLD","XAU/USD","XAUUSDz","XAUUSDi"]
+DJ30_NAMES   = ["US30","DJ30","DJIA","US30Cash","DJ30Cash","WallSt30","WallStreet30","US30m","DJI","Dow30"]
 
-def _riesgo_news(eventos):
-    ahora = datetime.now(timezone.utc)
-    for e in eventos:
-        d = (e["dt"] - ahora).total_seconds() / 60
-        if -30 <= d <= 30:
-            return "PELIGRO",   f"🔴 PELIGRO — {e['titulo']} {'+' if d>0 else ''}{int(d)} min"
-        elif 30 < d <= 120:
-            return "PRECAUCIÓN", f"🟡 PRECAUCIÓN — {e['titulo']} en {int(d)} min"
-    futuros = [e for e in eventos if (e["dt"]-ahora).total_seconds() > 0]
-    if futuros:
-        p = futuros[0]; m = int((p["dt"]-ahora).total_seconds()/60)
-        return "SEGURO", f"🟢 SEGURO — Próximo: {p['titulo']} en {m} min"
-    return "SEGURO", "🟢 SEGURO — Sin eventos de alto impacto hoy"
-
-# ─── INDICADORES ─────────────────────────────────────────────────────────────
-def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def _sma(s, n): return s.rolling(n).mean()
-
-def _atr(df, n=14):
-    h, l, c = df.high, df.low, df.close
-    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def _rsi(s, n=14):
-    d = s.diff()
-    g = d.where(d > 0, 0).rolling(n).mean()
-    lo = (-d.where(d < 0, 0)).rolling(n).mean()
-    rs = g / lo.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
-
-def _bb(s, n=20, k=2):
-    ma = _sma(s, n); std = s.rolling(n).std()
-    return ma + k*std, ma, ma - k*std
-
-def _kc(df, n=20, m=1.5):
-    mid = _ema(df.close, n); a = _atr(df, n)
-    return mid + m*a, mid, mid - m*a
-
-def _swing_lows(df, n=3):
-    return [i for i in range(n, len(df)-n)
-            if df.low.iloc[i] == df.low.iloc[i-n:i+n+1].min()]
-
-def _swing_highs(df, n=3):
-    return [i for i in range(n, len(df)-n)
-            if df.high.iloc[i] == df.high.iloc[i-n:i+n+1].max()]
-
-# ─── RISK ─────────────────────────────────────────────────────────────────────
-def _risk(entry, sl, direction, pp=10):
-    d = abs(entry - sl)
-    if d < 0.01:
-        return None
-    s = 1 if direction == "buy" else -1
-    return dict(
-        sl_d=d,
-        tp1=entry + s*d*1.5,  rr1=1.5,  g1=d*1.5*pp,
-        tp2=entry + s*d*2.5,  rr2=2.5,  g2=d*2.5*pp,
-        tp3=entry + s*d*4.0,  rr3=4.0,  g3=d*4.0*pp,
-        tp4=entry + s*d*6.0,  rr4=6.0,  g4=d*6.0*pp,
-        tp5=entry + s*d*9.0,  rr5=9.0,  g5=d*9.0*pp,
-        riesgo=d*pp,
-    )
-
-def _fmt(v, decimals=2): return f"${v:,.{decimals}f}"
-
-XAUUSD_NAMES = [
-    "XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSD+", "XAUUSD.",
-    "Gold", "GOLD", "XAU/USD", "XAUUSDz", "XAUUSDi",
-]
-DJ30_NAMES = [
-    "US30", "DJ30", "DJIA", "US30Cash", "DJ30Cash",
-    "WallSt30", "WallStreet30", "US30m", "DJI", "Dow30",
-]
-
-def _find_sym_mt5(names):
-    for name in names:
-        if mt5.symbol_info(name) is None:
-            continue
-        mt5.symbol_select(name, True)
-        time.sleep(0.3)
-        tick = mt5.symbol_info_tick(name)
-        if tick and tick.bid > 0:
-            return name
-    keywords = {n.lower().replace("/","").replace(" ","") for n in names}
-    all_syms = mt5.symbols_get()
-    if all_syms:
-        for s in all_syms:
-            n = s.name.lower().replace("/","").replace(" ","")
-            if any(kw in n or n in kw for kw in keywords):
-                mt5.symbol_select(s.name, True)
-                time.sleep(0.3)
-                tick = mt5.symbol_info_tick(s.name)
-                if tick and tick.bid > 0:
-                    return s.name
+def _find_mt5(names):
+    for n in names:
+        if mt5.symbol_info(n) is None: continue
+        mt5.symbol_select(n, True); time.sleep(0.2)
+        t = mt5.symbol_info_tick(n)
+        if t and t.bid > 0: return n
+    kw = {n.lower().replace("/","").replace(" ","") for n in names}
+    all_s = mt5.symbols_get()
+    if all_s:
+        for s in all_s:
+            sn = s.name.lower().replace("/","").replace(" ","")
+            if any(k in sn or sn in k for k in kw):
+                mt5.symbol_select(s.name, True); time.sleep(0.2)
+                t = mt5.symbol_info_tick(s.name)
+                if t and t.bid > 0: return s.name
     return None
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _find_xauusd():
     if _mt5_ok():
-        sym = _find_sym_mt5(XAUUSD_NAMES)
-        if sym:
-            return sym, "MT5"
-    if _YF_OK and _yahoo_price_cached("GC=F"):
-        return "XAUUSD", "Yahoo"
+        s = _find_mt5(XAUUSD_NAMES)
+        if s: return s, "MT5"
+    if _YF_OK and _yf_price("GC=F"): return "XAUUSD","Yahoo"
     return None, None
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _find_dj30():
     if _mt5_ok():
-        sym = _find_sym_mt5(DJ30_NAMES)
-        if sym:
-            return sym, "MT5"
-    if _YF_OK and _yahoo_price_cached("^DJI"):
-        return "US30", "Yahoo"
+        s = _find_mt5(DJ30_NAMES)
+        if s: return s, "MT5"
+    if _YF_OK and _yf_price("^DJI"): return "US30","Yahoo"
     return None, None
 
-def _pip_val(symbol, provider="MT5"):
+def _pipval(symbol, provider="Yahoo"):
     if provider == "MT5" and _mt5_ok():
         info = mt5.symbol_info(symbol)
-        if info:
-            tv = info.trade_tick_value
-            ts = info.trade_tick_size
-            if ts > 0:
-                return tv / ts
-    yt = _yahoo_ticker(symbol)
-    if yt == "GC=F":  return 10
-    if yt == "^DJI":  return 1
-    return 10
+        if info and info.trade_tick_size > 0:
+            return info.trade_tick_value / info.trade_tick_size
+    yt = _yt(symbol)
+    return 10 if yt == "GC=F" else 1
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ESTRATEGIAS
+# NOTICIAS
 # ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_news():
+    ev = []
+    for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
+        try:
+            r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+            if r.status_code != 200: continue
+            for e in r.json():
+                if e.get("impact")=="High" and e.get("country")=="USD":
+                    try:
+                        dt = datetime.fromisoformat(e["date"]).astimezone(timezone.utc)
+                        ev.append({"dt":dt,"titulo":e.get("title","")})
+                    except: pass
+        except: pass
+    return sorted(ev, key=lambda x: x["dt"])
 
+def _news_risk(ev):
+    now = datetime.now(timezone.utc)
+    for e in ev:
+        d = (e["dt"]-now).total_seconds()/60
+        if -30 <= d <= 30:
+            return "PELIGRO", f"🔴 PELIGRO — {e['titulo']} {'+' if d>0 else ''}{int(d)} min"
+        if 30 < d <= 120:
+            return "PRECAUCION", f"🟡 PRECAUCIÓN — {e['titulo']} en {int(d)} min"
+    fut = [e for e in ev if (e["dt"]-now).total_seconds()>0]
+    if fut:
+        p=fut[0]; m=int((p["dt"]-now).total_seconds()/60)
+        return "SEGURO", f"🟢 Sin peligro — próximo: {p['titulo']} en {m} min"
+    return "SEGURO","🟢 Sin eventos de alto impacto"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INDICADORES
+# ═══════════════════════════════════════════════════════════════════════════════
+def _ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def _sma(s,n): return s.rolling(n).mean()
+def _rsi(s,n=14):
+    d=s.diff(); g=d.where(d>0,0).rolling(n).mean()
+    lo=(-d.where(d<0,0)).rolling(n).mean()
+    return 100-100/(1+g/lo.replace(0,np.nan))
+def _atr(df,n=14):
+    h,l,c=df.high,df.low,df.close
+    tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+def _bb(s,n=20,k=2):
+    ma=_sma(s,n); std=s.rolling(n).std()
+    return ma+k*std, ma, ma-k*std
+def _kc(df,n=20,m=1.5):
+    mid=_ema(df.close,n); a=_atr(df,n)
+    return mid+m*a, mid, mid-m*a
+def _swing_lows(df,n=3):
+    return [i for i in range(n,len(df)-n) if df.low.iloc[i]==df.low.iloc[i-n:i+n+1].min()]
+def _swing_highs(df,n=3):
+    return [i for i in range(n,len(df)-n) if df.high.iloc[i]==df.high.iloc[i-n:i+n+1].max()]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RIESGO — TP1·1.5 | TP2·2.5 | TP3·4.0
+# ═══════════════════════════════════════════════════════════════════════════════
+def _risk(entry, sl, direction, pp=10):
+    d = abs(entry-sl)
+    if d < 0.01: return None
+    s = 1 if direction=="buy" else -1
+    return dict(sl_d=d,
+                tp1=entry+s*d*1.5, rr1=1.5, g1=d*1.5*pp,
+                tp2=entry+s*d*2.5, rr2=2.5, g2=d*2.5*pp,
+                tp3=entry+s*d*4.0, rr3=4.0, g3=d*4.0*pp,
+                riesgo=d*pp)
+
+def _fmt(v, dec=2): return f"{v:,.{dec}f}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESTRATEGIAS — detectores de señal (sin cambios de lógica)
+# ═══════════════════════════════════════════════════════════════════════════════
 def strat_london_breakout(df_h1, precio):
-    """Ruptura del rango asiático al abrir Londres (07:00–10:00 UTC)"""
-    ahora = datetime.now(timezone.utc)
-    h = ahora.hour
-    if not (7 <= h < 10):
-        return None
-    hoy = ahora.replace(hour=0, minute=0, second=0, microsecond=0)
-    asian = df_h1[(df_h1.index >= hoy) & (df_h1.index < hoy.replace(hour=7))]
-    if len(asian) < 3:
-        return None
-    a_hi = asian.high.max(); a_lo = asian.low.min()
-    a_rng = a_hi - a_lo
-    if a_rng < 5:
-        return None
-    at = _atr(df_h1).iloc[-1]
-    thr = a_rng * 0.12
-
-    for direction, cond, sl_ref in [
-        ("buy",  precio > a_hi + thr, a_lo - at * 0.5),
-        ("sell", precio < a_lo - thr, a_hi + at * 0.5),
+    ahora = datetime.now(timezone.utc); h=ahora.hour
+    if not (7<=h<10): return None
+    hoy=ahora.replace(hour=0,minute=0,second=0,microsecond=0)
+    asian=df_h1[(df_h1.index>=hoy)&(df_h1.index<hoy.replace(hour=7))]
+    if len(asian)<3: return None
+    a_hi=asian.high.max(); a_lo=asian.low.min(); a_rng=a_hi-a_lo
+    if a_rng<5: return None
+    at=_atr(df_h1).iloc[-1]; thr=a_rng*0.12
+    for direction,cond,sl_ref in [
+        ("buy", precio>a_hi+thr, a_lo-at*0.5),
+        ("sell",precio<a_lo-thr, a_hi+at*0.5),
     ]:
-        if not cond:
-            continue
-        r = _risk(precio, sl_ref, direction)
-        if r is None:
-            continue
-        score = 58
-        # Rango limpio
-        body_sum = (asian.close - asian.open).abs().sum()
-        rng_sum  = (asian.high - asian.low).sum()
-        if rng_sum > 0 and body_sum / rng_sum > 0.55:
-            score += 8
-        # Primera ruptura
-        ld = df_h1[df_h1.index >= hoy.replace(hour=7)]
-        breaks = (ld.high > a_hi).sum() if direction == "buy" else (ld.low < a_lo).sum()
-        if breaks <= 1:
-            score += 10
-        # ATR elevado
-        at_avg = _atr(df_h1).rolling(20).mean().iloc[-1]
-        if at > at_avg * 1.15:
-            score += 6
-        return dict(estrategia="LONDON BREAKOUT", icon="🇬🇧", dir=direction,
-                    tipo="📅 INTRADAY", duracion="~1-4h",
-                    entry=precio, sl=sl_ref, score_base=min(score, 88),
-                    contexto=f"Rango asiático ${a_lo:.2f}–${a_hi:.2f} ({a_rng:.1f} pts). ATR H1: {at:.1f}",
-                    **r)
+        if not cond: continue
+        r=_risk(precio,sl_ref,direction)
+        if r is None: continue
+        sc=58
+        body_sum=(asian.close-asian.open).abs().sum(); rng_sum=(asian.high-asian.low).sum()
+        if rng_sum>0 and body_sum/rng_sum>0.55: sc+=8
+        ld=df_h1[df_h1.index>=hoy.replace(hour=7)]
+        breaks=(ld.high>a_hi).sum() if direction=="buy" else (ld.low<a_lo).sum()
+        if breaks<=1: sc+=10
+        at_avg=_atr(df_h1).rolling(20).mean().iloc[-1]
+        if at>at_avg*1.15: sc+=6
+        return dict(estrategia="LONDON BREAKOUT",icon="🇬🇧",dir=direction,tipo="INTRADAY",
+                    dur="~1-4h",entry=precio,sl=sl_ref,score_base=min(sc,88),
+                    ctx=f"Rango asiático {a_lo:.2f}–{a_hi:.2f} ({a_rng:.1f} pts)",**r)
     return None
 
-
-def strat_trend_pullback(df_d1, df_h4, df_h1, df_m15, precio):
-    """Tendencia MTF alineada D1+H4+H1 + pullback a EMA en M15"""
-    for df, n in [(df_d1, 30), (df_h4, 50), (df_h1, 60), (df_m15, 30)]:
-        if df is None or len(df) < n:
-            return None
-
-    e20d = _ema(df_d1.close, 20).iloc[-1];  e50d = _ema(df_d1.close, 50).iloc[-1]
-    e20h4= _ema(df_h4.close, 20).iloc[-1];  e50h4= _ema(df_h4.close, 50).iloc[-1]
-    e20h = _ema(df_h1.close, 20).iloc[-1];  e50h = _ema(df_h1.close, 50).iloc[-1]
-    e200h= _ema(df_h1.close,200).iloc[-1]
-
-    d1_bull  = df_d1.close.iloc[-1]  > e20d  > e50d
-    h4_bull  = e20h4 > e50h4
-    h1_stack = e20h  > e50h  > e200h
-    d1_bear  = df_d1.close.iloc[-1]  < e20d  < e50d
-    h4_bear  = e20h4 < e50h4
-    h1_down  = e20h  < e50h  < e200h
-
-    bull = sum([d1_bull, h4_bull, h1_stack])
-    bear = sum([d1_bear, h4_bear, h1_down])
-    if bull < 2 and bear < 2:
-        return None
-
-    at  = _atr(df_h1).iloc[-1]
-    rs  = _rsi(df_m15.close).iloc[-1]
-    direction = "buy" if bull >= bear else "sell"
-
-    if direction == "buy":
-        dist = precio - e20h
-        if not (-at * 0.9 <= dist <= at * 0.4):
-            return None
-        if not (35 <= rs <= 55):
-            return None
-        sl = e50h - at * 0.3
-        score = 62 + bull * 9
-        if 40 <= rs <= 50: score += 5
+def strat_trend_pullback(df_d1,df_h4,df_h1,df_m15,precio):
+    for df,n in [(df_d1,30),(df_h4,50),(df_h1,60),(df_m15,30)]:
+        if df is None or len(df)<n: return None
+    e20d=_ema(df_d1.close,20).iloc[-1]; e50d=_ema(df_d1.close,50).iloc[-1]
+    e20h4=_ema(df_h4.close,20).iloc[-1]; e50h4=_ema(df_h4.close,50).iloc[-1]
+    e20h=_ema(df_h1.close,20).iloc[-1];  e50h=_ema(df_h1.close,50).iloc[-1]; e200h=_ema(df_h1.close,200).iloc[-1]
+    d1b=df_d1.close.iloc[-1]>e20d>e50d; h4b=e20h4>e50h4; h1b=e20h>e50h>e200h
+    d1s=df_d1.close.iloc[-1]<e20d<e50d; h4s=e20h4<e50h4; h1s=e20h<e50h<e200h
+    bull=sum([d1b,h4b,h1b]); bear=sum([d1s,h4s,h1s])
+    if bull<2 and bear<2: return None
+    at=_atr(df_h1).iloc[-1]; rs=_rsi(df_m15.close).iloc[-1]
+    direction="buy" if bull>=bear else "sell"
+    if direction=="buy":
+        dist=precio-e20h
+        if not (-at*0.9<=dist<=at*0.4): return None
+        if not (35<=rs<=55): return None
+        sl=e50h-at*0.3; sc=62+bull*9+(5 if 40<=rs<=50 else 0)
     else:
-        dist = e20h - precio
-        if not (-at * 0.9 <= dist <= at * 0.4):
-            return None
-        if not (45 <= rs <= 65):
-            return None
-        sl = e50h + at * 0.3
-        score = 62 + bear * 9
-        if 50 <= rs <= 60: score += 5
+        dist=e20h-precio
+        if not (-at*0.9<=dist<=at*0.4): return None
+        if not (45<=rs<=65): return None
+        sl=e50h+at*0.3; sc=62+bear*9+(5 if 50<=rs<=60 else 0)
+    r=_risk(precio,sl,direction)
+    if r is None: return None
+    td=f"D1:{'▲' if d1b else '▼'}  H4:{'▲' if h4b else '▼'}  H1:{'▲' if h1b else '▼'}"
+    return dict(estrategia="PULLBACK TENDENCIA MTF",icon="📐",dir=direction,tipo="SWING",
+                dur="~4-24h",entry=precio,sl=sl,score_base=min(sc,93),
+                ctx=f"{td} · RSI M15:{rs:.0f} · EMA20 H1:{e20h:.2f}",**r)
 
-    r = _risk(precio, sl, direction)
-    if r is None:
-        return None
-    td = f"D1:{'▲' if d1_bull else '▼' if d1_bear else '–'}  H4:{'▲' if h4_bull else '▼' if h4_bear else '–'}  H1:{'▲' if h1_stack else '▼' if h1_down else '–'}"
-    return dict(estrategia="PULLBACK TENDENCIA MTF", icon="📐", dir=direction,
-                tipo="📊 SWING", duracion="~4-24h",
-                entry=precio, sl=sl, score_base=min(score, 93),
-                contexto=f"{td} · RSI M15: {rs:.0f} · EMA20 H1: ${e20h:.2f}",
-                **r)
-
-
-def strat_ema_momentum(df_h1, df_m15, precio):
-    """Cruce EMA9/21 en H1 con RSI confirmando momentum"""
-    if df_h1 is None or len(df_h1) < 30 or df_m15 is None or len(df_m15) < 20:
-        return None
-    e9  = _ema(df_h1.close, 9)
-    e21 = _ema(df_h1.close, 21)
-    e50 = _ema(df_h1.close, 50)
-    at  = _atr(df_h1).iloc[-1]
-    at_avg = _atr(df_h1).rolling(20).mean().iloc[-1]
-    if at < at_avg * 0.65:
-        return None  # mercado dormido
-
-    rh = _rsi(df_h1.close).iloc[-1]
-    rm = _rsi(df_m15.close).iloc[-1]
-
-    cross_b = e9.iloc[-2] < e21.iloc[-2] and e9.iloc[-1] > e21.iloc[-1]
-    cross_s = e9.iloc[-2] > e21.iloc[-2] and e9.iloc[-1] < e21.iloc[-1]
-    # Cruce reciente (≤ 2 barras atrás)
-    if not cross_b and not cross_s:
-        cross_b = e9.iloc[-3] < e21.iloc[-3] and e9.iloc[-2] > e21.iloc[-2] and precio > e9.iloc[-1]
-        cross_s = e9.iloc[-3] > e21.iloc[-3] and e9.iloc[-2] < e21.iloc[-2] and precio < e9.iloc[-1]
-    if not cross_b and not cross_s:
-        return None
-
-    if cross_b and 48 <= rh <= 72 and precio > e21.iloc[-1] * 0.998:
-        sl = e21.iloc[-1] - at * 0.5
-        score = 63
-        if precio > e50.iloc[-1]: score += 8
-        if 52 < rh < 65:          score += 5
-        if 52 < rm < 65:          score += 4
-        r = _risk(precio, sl, "buy")
+def strat_ema_momentum(df_h1,df_m15,precio):
+    if df_h1 is None or len(df_h1)<30 or df_m15 is None or len(df_m15)<20: return None
+    e9=_ema(df_h1.close,9); e21=_ema(df_h1.close,21); e50=_ema(df_h1.close,50)
+    at=_atr(df_h1).iloc[-1]; at_avg=_atr(df_h1).rolling(20).mean().iloc[-1]
+    if at<at_avg*0.65: return None
+    rh=_rsi(df_h1.close).iloc[-1]; rm=_rsi(df_m15.close).iloc[-1]
+    cb=e9.iloc[-2]<e21.iloc[-2] and e9.iloc[-1]>e21.iloc[-1]
+    cs=e9.iloc[-2]>e21.iloc[-2] and e9.iloc[-1]<e21.iloc[-1]
+    if not cb and not cs:
+        cb=e9.iloc[-3]<e21.iloc[-3] and e9.iloc[-2]>e21.iloc[-2] and precio>e9.iloc[-1]
+        cs=e9.iloc[-3]>e21.iloc[-3] and e9.iloc[-2]<e21.iloc[-2] and precio<e9.iloc[-1]
+    if not cb and not cs: return None
+    if cb and 48<=rh<=72 and precio>e21.iloc[-1]*0.998:
+        sl=e21.iloc[-1]-at*0.5; sc=63+(8 if precio>e50.iloc[-1] else 0)+(5 if 52<rh<65 else 0)+(4 if 52<rm<65 else 0)
+        r=_risk(precio,sl,"buy")
         if r is None: return None
-        return dict(estrategia="CRUCE EMA MOMENTUM", icon="⚡", dir="buy",
-                    tipo="📅 INTRADAY", duracion="~1-4h",
-                    entry=precio, sl=sl, score_base=min(score, 85),
-                    contexto=f"Cruce alcista EMA9/21 H1 · RSI H1:{rh:.0f}  M15:{rm:.0f} · ATR:{at:.1f}",
-                    **r)
-
-    if cross_s and 28 <= rh <= 52 and precio < e21.iloc[-1] * 1.002:
-        sl = e21.iloc[-1] + at * 0.5
-        score = 63
-        if precio < e50.iloc[-1]: score += 8
-        if 35 < rh < 48:          score += 5
-        if 35 < rm < 48:          score += 4
-        r = _risk(precio, sl, "sell")
+        return dict(estrategia="CRUCE EMA MOMENTUM",icon="⚡",dir="buy",tipo="INTRADAY",dur="~1-4h",
+                    entry=precio,sl=sl,score_base=min(sc,85),ctx=f"Cruce EMA9/21 H1 ↑ · RSI H1:{rh:.0f} M15:{rm:.0f}",**r)
+    if cs and 28<=rh<=52 and precio<e21.iloc[-1]*1.002:
+        sl=e21.iloc[-1]+at*0.5; sc=63+(8 if precio<e50.iloc[-1] else 0)+(5 if 35<rh<48 else 0)+(4 if 35<rm<48 else 0)
+        r=_risk(precio,sl,"sell")
         if r is None: return None
-        return dict(estrategia="CRUCE EMA MOMENTUM", icon="⚡", dir="sell",
-                    tipo="📅 INTRADAY", duracion="~1-4h",
-                    entry=precio, sl=sl, score_base=min(score, 85),
-                    contexto=f"Cruce bajista EMA9/21 H1 · RSI H1:{rh:.0f}  M15:{rm:.0f} · ATR:{at:.1f}",
-                    **r)
+        return dict(estrategia="CRUCE EMA MOMENTUM",icon="⚡",dir="sell",tipo="INTRADAY",dur="~1-4h",
+                    entry=precio,sl=sl,score_base=min(sc,85),ctx=f"Cruce EMA9/21 H1 ↓ · RSI H1:{rh:.0f} M15:{rm:.0f}",**r)
     return None
 
-
-def strat_supply_demand(df_h4, df_h1, precio):
-    """Precio en zona de oferta/demanda H4 confirmada con RSI"""
-    if df_h4 is None or len(df_h4) < 50 or df_h1 is None or len(df_h1) < 20:
-        return None
-    at4 = _atr(df_h4).iloc[-1]
-    at1 = _atr(df_h1).iloc[-1]
-    rh  = _rsi(df_h1.close).iloc[-1]
-
-    for idx in _swing_lows(df_h4, n=4)[-10:]:
-        z = df_h4.low.iloc[idx]
-        zt, zb = z + at4, z - at4 * 0.3
-        if zb <= precio <= zt and rh < 42:
-            sl = z - at4 * 0.45
-            r  = _risk(precio, sl, "buy")
+def strat_supply_demand(df_h4,df_h1,precio):
+    if df_h4 is None or len(df_h4)<50 or df_h1 is None or len(df_h1)<20: return None
+    at4=_atr(df_h4).iloc[-1]; rh=_rsi(df_h1.close).iloc[-1]
+    for idx in _swing_lows(df_h4,n=4)[-10:]:
+        z=df_h4.low.iloc[idx]; zt,zb=z+at4,z-at4*0.3
+        if zb<=precio<=zt and rh<42:
+            sl=z-at4*0.45; r=_risk(precio,sl,"buy")
             if r is None: continue
-            tests = sum(1 for i in range(len(df_h4)) if zb <= df_h4.low.iloc[i] <= zt)
-            score = 66 + (10 if tests <= 2 else 0) + (10 if rh < 35 else 0)
-            return dict(estrategia="ZONA DE DEMANDA (S&D)", icon="🏛️", dir="buy",
-                        tipo="📊 SWING", duracion="~4-24h",
-                        entry=precio, sl=sl, score_base=min(score, 92),
-                        contexto=f"Zona demanda H4: ${z:.2f} · RSI H1:{rh:.0f} · Testeada {tests}x",
-                        **r)
-
-    for idx in _swing_highs(df_h4, n=4)[-10:]:
-        z = df_h4.high.iloc[idx]
-        zb, zt = z - at4, z + at4 * 0.3
-        if zb <= precio <= zt and rh > 58:
-            sl = z + at4 * 0.45
-            r  = _risk(precio, sl, "sell")
+            tests=sum(1 for i in range(len(df_h4)) if zb<=df_h4.low.iloc[i]<=zt)
+            sc=66+(10 if tests<=2 else 0)+(10 if rh<35 else 0)
+            return dict(estrategia="ZONA DEMANDA S&D",icon="🏛️",dir="buy",tipo="SWING",dur="~4-24h",
+                        entry=precio,sl=sl,score_base=min(sc,92),ctx=f"Zona {z:.2f} · RSI:{rh:.0f} · {tests}x testeada",**r)
+    for idx in _swing_highs(df_h4,n=4)[-10:]:
+        z=df_h4.high.iloc[idx]; zb,zt=z-at4,z+at4*0.3
+        if zb<=precio<=zt and rh>58:
+            sl=z+at4*0.45; r=_risk(precio,sl,"sell")
             if r is None: continue
-            tests = sum(1 for i in range(len(df_h4)) if zb <= df_h4.high.iloc[i] <= zt)
-            score = 66 + (10 if tests <= 2 else 0) + (10 if rh > 65 else 0)
-            return dict(estrategia="ZONA DE OFERTA (S&D)", icon="🏛️", dir="sell",
-                        tipo="📊 SWING", duracion="~4-24h",
-                        entry=precio, sl=sl, score_base=min(score, 92),
-                        contexto=f"Zona oferta H4: ${z:.2f} · RSI H1:{rh:.0f} · Testeada {tests}x",
-                        **r)
+            tests=sum(1 for i in range(len(df_h4)) if zb<=df_h4.high.iloc[i]<=zt)
+            sc=66+(10 if tests<=2 else 0)+(10 if rh>65 else 0)
+            return dict(estrategia="ZONA OFERTA S&D",icon="🏛️",dir="sell",tipo="SWING",dur="~4-24h",
+                        entry=precio,sl=sl,score_base=min(sc,92),ctx=f"Zona {z:.2f} · RSI:{rh:.0f} · {tests}x testeada",**r)
     return None
 
-
-def strat_bb_squeeze(df_h1, precio):
-    """Bollinger Bands dentro de Keltner Channel → liberación con dirección"""
-    if df_h1 is None or len(df_h1) < 30:
-        return None
-    bb_u, bb_m, bb_d = _bb(df_h1.close, 20, 2)
-    kc_u, kc_m, kc_d = _kc(df_h1, 20, 1.5)
-    at = _atr(df_h1).iloc[-1]
-    rh = _rsi(df_h1.close).iloc[-1]
-
-    # Squeeze activo en barra -2
-    sq = bb_u.iloc[-2] < kc_u.iloc[-2] and bb_d.iloc[-2] > kc_d.iloc[-2]
-    if not sq:
-        sq = bb_u.iloc[-3] < kc_u.iloc[-3] and bb_d.iloc[-3] > kc_d.iloc[-3]
-    if not sq:
-        return None
-    # Liberación en barra -1
-    released = bb_u.iloc[-1] > kc_u.iloc[-1] or bb_d.iloc[-1] < kc_d.iloc[-1]
-    if not released:
-        return None
-
-    roc = (df_h1.close.iloc[-1] / df_h1.close.iloc[-6] - 1) * 100
-
-    if roc > 0.1 and precio > bb_m.iloc[-1] and rh > 50:
-        sl = bb_m.iloc[-1] - at * 0.5
-        r  = _risk(precio, sl, "buy")
+def strat_bb_squeeze(df_h1,precio):
+    if df_h1 is None or len(df_h1)<30: return None
+    bbu,bbm,bbd=_bb(df_h1.close,20,2); kcu,kcm,kcd=_kc(df_h1,20,1.5)
+    at=_atr(df_h1).iloc[-1]; rh=_rsi(df_h1.close).iloc[-1]
+    sq=bbu.iloc[-2]<kcu.iloc[-2] and bbd.iloc[-2]>kcd.iloc[-2]
+    if not sq: sq=bbu.iloc[-3]<kcu.iloc[-3] and bbd.iloc[-3]>kcd.iloc[-3]
+    if not sq: return None
+    rel=bbu.iloc[-1]>kcu.iloc[-1] or bbd.iloc[-1]<kcd.iloc[-1]
+    if not rel: return None
+    roc=(df_h1.close.iloc[-1]/df_h1.close.iloc[-6]-1)*100
+    if roc>0.1 and precio>bbm.iloc[-1] and rh>50:
+        sl=bbm.iloc[-1]-at*0.5; r=_risk(precio,sl,"buy")
         if r is None: return None
-        score = 68 + (7 if roc > 0.3 else 0) + (5 if rh > 55 else 0)
-        return dict(estrategia="BB SQUEEZE BREAKOUT", icon="💥", dir="buy",
-                    tipo="📅 INTRADAY", duracion="~1-3h",
-                    entry=precio, sl=sl, score_base=min(score, 88),
-                    contexto=f"Squeeze liberado ↑ · ROC5: +{roc:.2f}% · RSI H1:{rh:.0f}",
-                    **r)
-
-    if roc < -0.1 and precio < bb_m.iloc[-1] and rh < 50:
-        sl = bb_m.iloc[-1] + at * 0.5
-        r  = _risk(precio, sl, "sell")
+        sc=68+(7 if roc>0.3 else 0)+(5 if rh>55 else 0)
+        return dict(estrategia="BB SQUEEZE BREAKOUT",icon="💥",dir="buy",tipo="INTRADAY",dur="~1-3h",
+                    entry=precio,sl=sl,score_base=min(sc,88),ctx=f"Squeeze ↑ · ROC:{roc:.2f}% · RSI:{rh:.0f}",**r)
+    if roc<-0.1 and precio<bbm.iloc[-1] and rh<50:
+        sl=bbm.iloc[-1]+at*0.5; r=_risk(precio,sl,"sell")
         if r is None: return None
-        score = 68 + (7 if roc < -0.3 else 0) + (5 if rh < 45 else 0)
-        return dict(estrategia="BB SQUEEZE BREAKOUT", icon="💥", dir="sell",
-                    tipo="📅 INTRADAY", duracion="~1-3h",
-                    entry=precio, sl=sl, score_base=min(score, 88),
-                    contexto=f"Squeeze liberado ↓ · ROC5: {roc:.2f}% · RSI H1:{rh:.0f}",
-                    **r)
+        sc=68+(7 if roc<-0.3 else 0)+(5 if rh<45 else 0)
+        return dict(estrategia="BB SQUEEZE BREAKOUT",icon="💥",dir="sell",tipo="INTRADAY",dur="~1-3h",
+                    entry=precio,sl=sl,score_base=min(sc,88),ctx=f"Squeeze ↓ · ROC:{roc:.2f}% · RSI:{rh:.0f}",**r)
     return None
 
-
-def strat_precio_accion(df_h1, precio, df_d1=None, df_h4=None):
-    """
-    Patrones de vela H1: Engulfing y Pin Bar.
-    REGLAS ANTI-RUIDO:
-    1. Filtro MTF — si 2+ TF apuntan en contra, bloquear señal
-    2. Confirmación de nivel — precio debe RESPETAR el nivel (no romperlo)
-    3. Solo permite contra-tendencia si RSI extremo (< 25 o > 75)
-    """
-    if df_h1 is None or len(df_h1) < 5:
-        return None
-    at = _atr(df_h1).iloc[-1]
-    rh = _rsi(df_h1.close).iloc[-1]
-    # Usar barra [-2] para patrón completado, [-1] para confirmación parcial
-    o2,h2,l2,c2 = df_h1[["open","high","low","close"]].iloc[-2].values
-    o1,h1_,l1,c1 = df_h1[["open","high","low","close"]].iloc[-1].values
-    b2 = abs(c2-o2); b1 = abs(c1-o1); rng1 = h1_-l1
-    if rng1 < at * 0.3:
-        return None
-
-    # Detectar patrones en barra completada [-2]
-    bull_eng = (c2 > o2) and b2 > abs(c1-o1)*0.8   # vela alcista fuerte anterior
-    bear_eng = (c2 < o2) and b2 > abs(c1-o1)*0.8   # vela bajista fuerte anterior
-    # Patrón en barra más reciente [-1]
-    hammer   = (b1 > 0) and (c1-l1) > b1*2.5 and (c1 > o1) and (h1_-c1) < b1*0.4
-    shooting = (b1 > 0) and (h1_-c1) > b1*2.5 and (c1 < o1) and (c1-l1) < b1*0.4
-    # Engulfing entre barras [-2] y [-1]
-    eng_bull = (c2 < o2) and (c1 > o1) and (c1 > o2) and (o1 < c2) and b1 > b2*1.1
-    eng_bear = (c2 > o2) and (c1 < o1) and (c1 < o2) and (o1 > c2) and b1 > b2*1.1
-
-    buy_pattern  = hammer or eng_bull
-    sell_pattern = shooting or eng_bear
-    if not buy_pattern and not sell_pattern:
-        return None
-
-    # ── FILTRO MTF ────────────────────────────────────────────────────────────
-    # Contar cuántos TF están en tendencia bajista o alcista
-    mtf_bear = 0
-    mtf_bull = 0
-    if df_d1 is not None and len(df_d1) >= 50:
-        e20d = _ema(df_d1.close, 20).iloc[-1]
-        if df_d1.close.iloc[-1] < e20d: mtf_bear += 1
-        else:                            mtf_bull += 1
-    if df_h4 is not None and len(df_h4) >= 30:
-        e20h4 = _ema(df_h4.close, 20).iloc[-1]
-        e50h4 = _ema(df_h4.close, 50).iloc[-1]
-        if e20h4 < e50h4: mtf_bear += 1
-        else:              mtf_bull += 1
-    if len(df_h1) >= 50:
-        e50h1 = _ema(df_h1.close, 50).iloc[-1]
-        if df_h1.close.iloc[-1] < e50h1: mtf_bear += 1
-        else:                              mtf_bull += 1
-
-    # Bloquear contra-tendencia a menos que RSI sea extremo
-    if buy_pattern and mtf_bear >= 2 and rh > 28:
-        return None   # martillo en tendencia bajista fuerte = ruido
-    if sell_pattern and mtf_bull >= 2 and rh < 72:
-        return None   # estrella en tendencia alcista fuerte = ruido
-
-    # ── CONFIRMACIÓN DE NIVEL ─────────────────────────────────────────────────
-    # El precio debe estar RESPETANDO el nivel, no rompiéndolo
-    # Para BUY: precio actual >= close del patrón (no cayó a través del soporte)
-    # Para SELL: precio actual <= close del patrón (no rebotó a través de la resistencia)
-    if buy_pattern  and precio < c1 * 0.9995:
-        return None  # precio cayó por debajo del cierre → nivel roto, no comprar
-    if sell_pattern and precio > c1 * 1.0005:
-        return None  # precio subió sobre el cierre → nivel roto, no vender
-
-    # ── NIVEL CLAVE ───────────────────────────────────────────────────────────
-    near_key = False
-    for step in [50, 100]:
-        rnd = round(precio / step) * step
-        if abs(precio - rnd) <= at * 1.5:
-            near_key = True; break
-    if df_d1 is not None and len(df_d1) >= 2:
-        pd_h = df_d1.high.iloc[-2]; pd_l = df_d1.low.iloc[-2]
-        if abs(precio-pd_h) <= at*1.5 or abs(precio-pd_l) <= at*1.5:
-            near_key = True
-
-    # Sin nivel clave Y contra tendencia = no vale la pena
-    if not near_key and (mtf_bear >= 1 or mtf_bull >= 1):
-        return None
-
-    tend_ctx = f"MTF: {'▼'*mtf_bear}{'▲'*mtf_bull}"
-
-    if buy_pattern and rh < 65:
-        sl = (l1 if hammer else min(l1,l2)) - at * 0.3
-        r  = _risk(c1, sl, "buy")
+def strat_precio_accion(df_h1,precio,df_d1=None,df_h4=None):
+    if df_h1 is None or len(df_h1)<5: return None
+    at=_atr(df_h1).iloc[-1]; rh=_rsi(df_h1.close).iloc[-1]
+    o2,h2,l2,c2=df_h1[["open","high","low","close"]].iloc[-2].values
+    o1,h1_,l1,c1=df_h1[["open","high","low","close"]].iloc[-1].values
+    b2=abs(c2-o2); b1=abs(c1-o1); rng1=h1_-l1
+    if rng1<at*0.3: return None
+    hammer=(b1>0)and(c1-l1)>b1*2.5 and(c1>o1)and(h1_-c1)<b1*0.4
+    shooting=(b1>0)and(h1_-c1)>b1*2.5 and(c1<o1)and(c1-l1)<b1*0.4
+    eng_bull=(c2<o2)and(c1>o1)and(c1>o2)and(o1<c2)and b1>b2*1.1
+    eng_bear=(c2>o2)and(c1<o1)and(c1<o2)and(o1>c2)and b1>b2*1.1
+    buy_pat=hammer or eng_bull; sell_pat=shooting or eng_bear
+    if not buy_pat and not sell_pat: return None
+    mtf_b=0; mtf_s=0
+    if df_d1 is not None and len(df_d1)>=50:
+        e20d=_ema(df_d1.close,20).iloc[-1]
+        if df_d1.close.iloc[-1]<e20d: mtf_s+=1
+        else: mtf_b+=1
+    if df_h4 is not None and len(df_h4)>=30:
+        e20h4=_ema(df_h4.close,20).iloc[-1]; e50h4=_ema(df_h4.close,50).iloc[-1]
+        if e20h4<e50h4: mtf_s+=1
+        else: mtf_b+=1
+    if len(df_h1)>=50:
+        e50h1=_ema(df_h1.close,50).iloc[-1]
+        if df_h1.close.iloc[-1]<e50h1: mtf_s+=1
+        else: mtf_b+=1
+    if buy_pat and mtf_s>=2 and rh>28: return None
+    if sell_pat and mtf_b>=2 and rh<72: return None
+    if buy_pat and precio<c1*0.9995: return None
+    if sell_pat and precio>c1*1.0005: return None
+    near=False
+    for step in [50,100]:
+        if abs(precio-round(precio/step)*step)<=at*1.5: near=True; break
+    if df_d1 is not None and len(df_d1)>=2:
+        if abs(precio-df_d1.high.iloc[-2])<=at*1.5 or abs(precio-df_d1.low.iloc[-2])<=at*1.5: near=True
+    if not near and (mtf_s>=1 or mtf_b>=1): return None
+    if buy_pat and rh<65:
+        sl=(l1 if hammer else min(l1,l2))-at*0.3; r=_risk(c1,sl,"buy")
         if r is None: return None
-        patron = "Engulfing Alcista" if eng_bull else "Martillo"
-        score  = 63 + (8 if eng_bull else 0) + (12 if near_key else 0)
-        score += (8 if rh < 35 else 0)
-        score += (5 if mtf_bull >= 1 else 0)   # bonus si al menos 1 TF a favor
-        return dict(estrategia=f"PRECIO ACCIÓN — {patron}", icon="🕯️", dir="buy",
-                    tipo="📅 INTRADAY", duracion="~1-4h",
-                    entry=c1, sl=sl, score_base=min(score, 91),
-                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {tend_ctx} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
-                    **r)
-
-    if sell_pattern and rh > 35:
-        sl = (h1_ if shooting else max(h1_,h2)) + at * 0.3
-        r  = _risk(c1, sl, "sell")
+        patron="Engulfing Alcista" if eng_bull else "Martillo"
+        sc=63+(8 if eng_bull else 0)+(12 if near else 0)+(8 if rh<35 else 0)+(5 if mtf_b>=1 else 0)
+        return dict(estrategia=f"PRECIO ACCIÓN — {patron}",icon="🕯️",dir="buy",tipo="INTRADAY",dur="~1-4h",
+                    entry=c1,sl=sl,score_base=min(sc,91),ctx=f"{patron} · RSI:{rh:.0f} · MTF:{'▼'*mtf_s}{'▲'*mtf_b}",**r)
+    if sell_pat and rh>35:
+        sl=(h1_ if shooting else max(h1_,h2))+at*0.3; r=_risk(c1,sl,"sell")
         if r is None: return None
-        patron = "Engulfing Bajista" if eng_bear else "Estrella Fugaz"
-        score  = 63 + (8 if eng_bear else 0) + (12 if near_key else 0)
-        score += (8 if rh > 65 else 0)
-        score += (5 if mtf_bear >= 1 else 0)
-        return dict(estrategia=f"PRECIO ACCIÓN — {patron}", icon="🕯️", dir="sell",
-                    tipo="📅 INTRADAY", duracion="~1-4h",
-                    entry=c1, sl=sl, score_base=min(score, 91),
-                    contexto=f"{patron} H1 · RSI:{rh:.0f} · {tend_ctx} · {'✓ Nivel clave' if near_key else 'Sin nivel'}",
-                    **r)
+        patron="Engulfing Bajista" if eng_bear else "Estrella Fugaz"
+        sc=63+(8 if eng_bear else 0)+(12 if near else 0)+(8 if rh>65 else 0)+(5 if mtf_s>=1 else 0)
+        return dict(estrategia=f"PRECIO ACCIÓN — {patron}",icon="🕯️",dir="sell",tipo="INTRADAY",dur="~1-4h",
+                    entry=c1,sl=sl,score_base=min(sc,91),ctx=f"{patron} · RSI:{rh:.0f} · MTF:{'▼'*mtf_s}{'▲'*mtf_b}",**r)
     return None
 
-
-# ─── ESTRATEGIAS SCALP (M5) ───────────────────────────────────────────────────
-def strat_scalp_ema(df_m5, df_m15, df_h1, precio):
-    """Cruce EMA9/21 en M5 con H1 a favor — entrada rápida 5-20 min"""
-    if any(df is None or len(df) < 30 for df in [df_m5, df_m15, df_h1]):
-        return None
-    e9  = _ema(df_m5.close,  9)
-    e21 = _ema(df_m5.close, 21)
-    at5 = _atr(df_m5).iloc[-1]
-    at5_avg = _atr(df_m5).rolling(20).mean().iloc[-1]
-    if at5 < at5_avg * 0.6:
-        return None   # mercado dormido, no scalp
-    rh1 = _rsi(df_h1.close).iloc[-1]
-    rm  = _rsi(df_m15.close).iloc[-1]
-    e20h1 = _ema(df_h1.close, 20).iloc[-1]
-    e50h1 = _ema(df_h1.close, 50).iloc[-1]
-    h1_bull = e20h1 > e50h1
-    h1_bear = e20h1 < e50h1
-
-    cross_b = e9.iloc[-2] < e21.iloc[-2] and e9.iloc[-1] > e21.iloc[-1]
-    cross_s = e9.iloc[-2] > e21.iloc[-2] and e9.iloc[-1] < e21.iloc[-1]
-    # cruce hace 1 barra también válido
-    if not cross_b and not cross_s:
-        cross_b = (e9.iloc[-3] < e21.iloc[-3] and e9.iloc[-2] > e21.iloc[-2]
-                   and precio > e9.iloc[-1])
-        cross_s = (e9.iloc[-3] > e21.iloc[-3] and e9.iloc[-2] < e21.iloc[-2]
-                   and precio < e9.iloc[-1])
-    if not cross_b and not cross_s:
-        return None
-
-    if cross_b and h1_bull and 48 <= rm <= 72:
-        sl = e21.iloc[-1] - at5 * 1.2
-        if abs(precio - sl) < 2:
-            return None  # SL demasiado pequeño (spread)
-        r = _risk(precio, sl, "buy")
+def strat_scalp_ema(df_m5,df_m15,df_h1,precio):
+    if any(df is None or len(df)<30 for df in [df_m5,df_m15,df_h1]): return None
+    e9=_ema(df_m5.close,9); e21=_ema(df_m5.close,21)
+    at5=_atr(df_m5).iloc[-1]; at5avg=_atr(df_m5).rolling(20).mean().iloc[-1]
+    if at5<at5avg*0.6: return None
+    rh1=_rsi(df_h1.close).iloc[-1]; rm=_rsi(df_m15.close).iloc[-1]
+    e20h1=_ema(df_h1.close,20).iloc[-1]; e50h1=_ema(df_h1.close,50).iloc[-1]
+    cb=e9.iloc[-2]<e21.iloc[-2] and e9.iloc[-1]>e21.iloc[-1]
+    cs=e9.iloc[-2]>e21.iloc[-2] and e9.iloc[-1]<e21.iloc[-1]
+    if not cb and not cs:
+        cb=(e9.iloc[-3]<e21.iloc[-3] and e9.iloc[-2]>e21.iloc[-2] and precio>e9.iloc[-1])
+        cs=(e9.iloc[-3]>e21.iloc[-3] and e9.iloc[-2]<e21.iloc[-2] and precio<e9.iloc[-1])
+    if not cb and not cs: return None
+    if cb and e20h1>e50h1 and 48<=rm<=72:
+        sl=e21.iloc[-1]-at5*1.2
+        if abs(precio-sl)<2: return None
+        r=_risk(precio,sl,"buy")
         if r is None: return None
-        score = 66 + (7 if rm > 55 else 0) + (5 if rh1 > 50 else 0)
-        return dict(estrategia="EMA SCALP M5", icon="🏹", dir="buy",
-                    tipo="🎯 SCALP", duracion="~5-20 min",
-                    entry=precio, sl=sl, score_base=min(score, 86),
-                    contexto=f"Cruce EMA9/21 M5 ↑ · RSI M15:{rm:.0f} · H1:{'▲' if h1_bull else '▼'}",
-                    **r)
-
-    if cross_s and h1_bear and 28 <= rm <= 52:
-        sl = e21.iloc[-1] + at5 * 1.2
-        if abs(precio - sl) < 2:
-            return None
-        r = _risk(precio, sl, "sell")
+        sc=66+(7 if rm>55 else 0)+(5 if rh1>50 else 0)
+        return dict(estrategia="EMA SCALP M5",icon="🏹",dir="buy",tipo="SCALP",dur="~5-20 min",
+                    entry=precio,sl=sl,score_base=min(sc,86),ctx=f"Cruce EMA9/21 M5 ↑ · RSI M15:{rm:.0f}",**r)
+    if cs and e20h1<e50h1 and 28<=rm<=52:
+        sl=e21.iloc[-1]+at5*1.2
+        if abs(precio-sl)<2: return None
+        r=_risk(precio,sl,"sell")
         if r is None: return None
-        score = 66 + (7 if rm < 45 else 0) + (5 if rh1 < 50 else 0)
-        return dict(estrategia="EMA SCALP M5", icon="🏹", dir="sell",
-                    tipo="🎯 SCALP", duracion="~5-20 min",
-                    entry=precio, sl=sl, score_base=min(score, 86),
-                    contexto=f"Cruce EMA9/21 M5 ↓ · RSI M15:{rm:.0f} · H1:{'▲' if h1_bull else '▼'}",
-                    **r)
+        sc=66+(7 if rm<45 else 0)+(5 if rh1<50 else 0)
+        return dict(estrategia="EMA SCALP M5",icon="🏹",dir="sell",tipo="SCALP",dur="~5-20 min",
+                    entry=precio,sl=sl,score_base=min(sc,86),ctx=f"Cruce EMA9/21 M5 ↓ · RSI M15:{rm:.0f}",**r)
     return None
 
-
-def strat_scalp_momentum(df_m15, df_h1, precio):
-    """
-    Vela de momentum fuerte en M15 + H1 alineado.
-    Entrada al retroceso mínimo (50% del cuerpo).
-    """
-    if df_m15 is None or len(df_m15) < 10 or df_h1 is None or len(df_h1) < 20:
-        return None
-    at15 = _atr(df_m15).iloc[-1]
-    rm   = _rsi(df_m15.close).iloc[-1]
-    e20h1 = _ema(df_h1.close, 20).iloc[-1]
-    e50h1 = _ema(df_h1.close, 50).iloc[-1]
-    h1_bull = e20h1 > e50h1
-    h1_bear = e20h1 < e50h1
-
-    # Vela de momentum: cuerpo > 70% del rango, tamaño > 1.5x ATR
-    o, h, l, c = df_m15[["open","high","low","close"]].iloc[-2].values
-    body = abs(c - o); rng = h - l
-    if rng < at15 * 1.3:
-        return None
-    if body < rng * 0.65:
-        return None
-
-    bull_mom = c > o  # vela alcista
-    bear_mom = c < o  # vela bajista
-
-    # Retroceso: precio no subió más del 60% del cuerpo (aún en zona de entrada)
-    retroceso_buy  = precio <= c + body * 0.3   # precio cerca del cierre
-    retroceso_sell = precio >= c - body * 0.3
-
-    if bull_mom and h1_bull and 50 < rm < 80 and retroceso_buy:
-        sl = l - at15 * 0.3
-        if abs(precio - sl) < 3:
-            return None
-        r = _risk(precio, sl, "buy")
+def strat_scalp_momentum(df_m15,df_h1,precio):
+    if df_m15 is None or len(df_m15)<10 or df_h1 is None or len(df_h1)<20: return None
+    at15=_atr(df_m15).iloc[-1]; rm=_rsi(df_m15.close).iloc[-1]
+    e20h1=_ema(df_h1.close,20).iloc[-1]; e50h1=_ema(df_h1.close,50).iloc[-1]
+    o,h,l,c=df_m15[["open","high","low","close"]].iloc[-2].values
+    body=abs(c-o); rng=h-l
+    if rng<at15*1.3 or body<rng*0.65: return None
+    if c>o and e20h1>e50h1 and 50<rm<80 and precio<=c+body*0.3:
+        sl=l-at15*0.3
+        if abs(precio-sl)<3: return None
+        r=_risk(precio,sl,"buy")
         if r is None: return None
-        score = 68 + (7 if rm > 60 else 0) + (5 if body > rng * 0.8 else 0)
-        return dict(estrategia="MOMENTUM M15", icon="🚀", dir="buy",
-                    tipo="🎯 SCALP", duracion="~15-45 min",
-                    entry=precio, sl=sl, score_base=min(score, 88),
-                    contexto=f"Vela alcista M15 {body:.1f}pts ({body/rng*100:.0f}% cuerpo) · RSI:{rm:.0f}",
-                    **r)
-
-    if bear_mom and h1_bear and 20 < rm < 50 and retroceso_sell:
-        sl = h + at15 * 0.3
-        if abs(precio - sl) < 3:
-            return None
-        r = _risk(precio, sl, "sell")
+        sc=68+(7 if rm>60 else 0)+(5 if body>rng*0.8 else 0)
+        return dict(estrategia="MOMENTUM M15",icon="🚀",dir="buy",tipo="SCALP",dur="~15-45 min",
+                    entry=precio,sl=sl,score_base=min(sc,88),ctx=f"Vela alcista M15 {body:.1f}pts · RSI:{rm:.0f}",**r)
+    if c<o and e20h1<e50h1 and 20<rm<50 and precio>=c-body*0.3:
+        sl=h+at15*0.3
+        if abs(precio-sl)<3: return None
+        r=_risk(precio,sl,"sell")
         if r is None: return None
-        score = 68 + (7 if rm < 40 else 0) + (5 if body > rng * 0.8 else 0)
-        return dict(estrategia="MOMENTUM M15", icon="🚀", dir="sell",
-                    tipo="🎯 SCALP", duracion="~15-45 min",
-                    entry=precio, sl=sl, score_base=min(score, 88),
-                    contexto=f"Vela bajista M15 {body:.1f}pts ({body/rng*100:.0f}% cuerpo) · RSI:{rm:.0f}",
-                    **r)
+        sc=68+(7 if rm<40 else 0)+(5 if body>rng*0.8 else 0)
+        return dict(estrategia="MOMENTUM M15",icon="🚀",dir="sell",tipo="SCALP",dur="~15-45 min",
+                    entry=precio,sl=sl,score_base=min(sc,88),ctx=f"Vela bajista M15 {body:.1f}pts · RSI:{rm:.0f}",**r)
+    return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HISTORIAL DE SEÑALES
+# SCORE PROFESIONAL — 7 componentes, 100 pts
 # ═══════════════════════════════════════════════════════════════════════════════
-import json, os as _os
+def _score_pro(sig, df_m1, df_m5, df_m15, df_h1, df_h4, precio):
+    d = sig["dir"]
+    pts = {}
 
-HISTORY_FILE = r"C:\Users\saems\raven_history.json"
+    # 1. Contexto H1/H4 — 20 pts
+    h4p = 0
+    if df_h4 is not None and len(df_h4) >= 50:
+        e20 = _ema(df_h4.close,20).iloc[-1]; e50 = _ema(df_h4.close,50).iloc[-1]
+        h4p = 10 if (e20>e50 if d=="buy" else e20<e50) else 0
+    h1p = 0
+    if df_h1 is not None and len(df_h1) >= 50:
+        e20=_ema(df_h1.close,20).iloc[-1]; e50=_ema(df_h1.close,50).iloc[-1]; c=df_h1.close.iloc[-1]
+        if d=="buy":  h1p = 10 if c>e20>e50 else (5 if c>e50 else 0)
+        else:         h1p = 10 if c<e20<e50 else (5 if c<e50 else 0)
+    pts["ctx_h1_h4"] = h4p + h1p  # max 20
 
-def _load_history():
+    # 2. Confirmación M15 — 15 pts
+    m15p = 0
+    if df_m15 is not None and len(df_m15) >= 20:
+        e9=_ema(df_m15.close,9).iloc[-1]; e21=_ema(df_m15.close,21).iloc[-1]
+        rsi15=_rsi(df_m15.close).iloc[-1]; c=df_m15.close.iloc[-1]
+        if d=="buy":  m15p = 15 if c>e9>e21 and rsi15>50 else (8 if c>e21 else 0)
+        else:         m15p = 15 if c<e9<e21 and rsi15<50 else (8 if c<e21 else 0)
+    pts["conf_m15"] = m15p  # max 15
+
+    # 3. Setup M5 — 25 pts (derivado del score_base de la estrategia)
+    raw = sig.get("score_base", 65)
+    pts["setup_m5"] = max(0, min(25, int((raw-55)/38*25)))  # max 25
+
+    # 4. Confirmación M1 — 10 pts
+    m1p = 0
+    if df_m1 is not None and len(df_m1) >= 13:
+        e9=_ema(df_m1.close,9).iloc[-1]
+        e21=_ema(df_m1.close,21).iloc[-1] if len(df_m1)>=21 else e9
+        c=df_m1.close.iloc[-1]
+        if d=="buy":  m1p = 10 if c>e9>e21 else (5 if c>e21 else 0)
+        else:         m1p = 10 if c<e9<e21 else (5 if c<e21 else 0)
+    pts["conf_m1"] = m1p  # max 10
+
+    # 5. Momentum — 10 pts
+    momp = 0
+    if df_m5 is not None and len(df_m5) >= 14:
+        rsi5 = _rsi(df_m5.close).iloc[-1]
+        if d=="buy":  momp = 10 if 50<=rsi5<=70 else (5 if 40<=rsi5<50 else 0)
+        else:         momp = 10 if 30<=rsi5<=50 else (5 if 50<rsi5<=60 else 0)
+    pts["momentum"] = momp  # max 10
+
+    # 6. Volatilidad/ATR — 10 pts
+    volp = 0
+    if df_h1 is not None and len(df_h1) >= 20:
+        atr=_atr(df_h1).iloc[-1]; avg=_atr(df_h1).rolling(20).mean().iloc[-1]
+        if avg > 0:
+            r = atr/avg
+            volp = 10 if 0.75<=r<=1.6 else (5 if r>1.6 else 3)
+    pts["vol_atr"] = volp  # max 10
+
+    # 7. Entrada limpia — 10 pts
+    entry=sig["entry"]; tp1=sig["tp1"]; dist=abs(tp1-entry)
+    if dist > 0:
+        prog = (precio-entry)/dist if d=="buy" else (entry-precio)/dist
+        if   prog <= 0.05: cleanp = 10
+        elif prog <= 0.15: cleanp = 8
+        elif prog <= 0.30: cleanp = 5
+        elif prog <= 0.50: cleanp = 2
+        else:              cleanp = 0
+    else:
+        cleanp = 0
+    pts["entrada_limpia"] = cleanp  # max 10
+
+    return min(sum(pts.values()), 100), pts
+
+
+def _score_label(score):
+    if score >= 90: return "PREMIUM",         "#ffd600"
+    if score >= 80: return "ALTA PROBABILIDAD","#00e676"
+    if score >= 70: return "OBSERVAR",         "#42a5f5"
+    return                  "NO OPERAR",       "#ff5252"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTEXTO MTF
+# ═══════════════════════════════════════════════════════════════════════════════
+def _contexto_mtf(df_m1, df_m5, df_m15, df_h1, df_h4):
+    def _tf(df, fast, slow):
+        if df is None or len(df) < slow:
+            return {"label":"Sin datos","color":"#333","bull":0,"bear":0,"rsi":50}
+        ef=_ema(df.close,fast).iloc[-1]; es=_ema(df.close,slow).iloc[-1]; c=df.close.iloc[-1]
+        rsi=_rsi(df.close).iloc[-1] if len(df)>=14 else 50
+        if c>ef>es:   return {"label":"▲ ALCISTA", "color":"#00e676","bull":1,"bear":0,"rsi":rsi}
+        if c<ef<es:   return {"label":"▼ BAJISTA", "color":"#ff5252","bull":0,"bear":1,"rsi":rsi}
+        if ef>es:     return {"label":"↗ LATERAL+","color":"#ffd600","bull":0.5,"bear":0,"rsi":rsi}
+        return              {"label":"↘ LATERAL−","color":"#ff9800","bull":0,"bear":0.5,"rsi":rsi}
+    return {
+        "H4":  _tf(df_h4,  20, 50),
+        "H1":  _tf(df_h1,  20, 50),
+        "M15": _tf(df_m15,  9, 21),
+        "M5":  _tf(df_m5,   9, 21),
+        "M1":  _tf(df_m1,   5, 13),
+    }
+
+def _razon_tipo(tipo, ctx):
+    h1  = ctx.get("H1",{}).get("label","?")
+    m15 = ctx.get("M15",{}).get("label","?")
+    m5  = ctx.get("M5",{}).get("label","?")
+    if tipo == "SCALP":
+        return f"Scalp: M5 {m5.lower()} con H1 {h1.lower()}. Duración estimada: minutos. Entrada precisa."
+    if tipo == "SWING":
+        return f"Swing: Contexto H4/H1 con tendencia clara ({h1.lower()}). Duración: horas a días."
+    return f"Intraday: H1 {h1.lower()} · M15 {m15.lower()} · setup ejecutado en M5 {m5.lower()}. Duración: 30 min – pocas horas."
+
+def _razones_no_trade(ctx, score_max, df_m5, df_h1):
+    r = []
+    h1=ctx.get("H1",{}); m15=ctx.get("M15",{})
+    if score_max < MIN_SCORE_SHOW:
+        r.append(f"Score máximo detectado: {score_max}/100 — mínimo requerido: {MIN_SCORE_SHOW}/100")
+    if h1.get("bull",0)>0.3 and m15.get("bear",0)>0.3:
+        r.append("Conflicto: H1 alcista pero M15 bajista — esperar alineación")
+    elif h1.get("bear",0)>0.3 and m15.get("bull",0)>0.3:
+        r.append("Conflicto: H1 bajista pero M15 alcista — esperar alineación")
+    rsi_h1=h1.get("rsi",50)
+    if 44<=rsi_h1<=56:
+        r.append(f"RSI H1 en zona neutral ({rsi_h1:.0f}) — sin momentum claro")
+    if df_m5 is not None and len(df_m5)>=20:
+        a=_atr(df_m5).iloc[-1]; avg=_atr(df_m5).rolling(20).mean().iloc[-1]
+        if avg>0 and a<avg*0.65:
+            r.append("Volatilidad M5 muy baja — mercado sin movimiento")
+    h1lbl=h1.get("label","")
+    if "LATERAL" in h1lbl:
+        r.append(f"H1 en zona lateral ({h1lbl}) — sin tendencia definida")
+    if not r:
+        r.append("No hay setup limpio con suficiente confirmación en este momento")
+        r.append("Esperar: ruptura de rango, pullback a zona clave, o alineación MTF")
+    return r
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MÁQUINA DE ESTADOS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _progreso(sig, precio):
+    e=sig["entry"]; tp1=sig["tp1"]; dist=abs(tp1-e)
+    if dist<=0: return 0
+    return ((precio-e)/dist) if sig["dir"]=="buy" else ((e-precio)/dist)
+
+def _transition(sig, precio, df_h1, df_m15):
+    state=sig.get("state","IDEA_EN_FORMACION")
+    d=sig["dir"]; e=sig["entry"]; sl=sig["sl"]
+    tp1=sig["tp1"]; tp2=sig["tp2"]; tp3=sig["tp3"]
+
+    # TP3
+    if (d=="buy" and precio>=tp3) or (d=="sell" and precio<=tp3):
+        return "TP3_ALCANZADO", f"Precio tocó TP3 ({tp3:.2f})"
+    # TP2
+    if state not in ("TP3_ALCANZADO","TP2_ALCANZADO"):
+        if (d=="buy" and precio>=tp2) or (d=="sell" and precio<=tp2):
+            return "TP2_ALCANZADO", f"Precio tocó TP2 ({tp2:.2f})"
+    # TP1
+    if state not in ("TP3_ALCANZADO","TP2_ALCANZADO","TP1_ALCANZADO"):
+        if (d=="buy" and precio>=tp1) or (d=="sell" and precio<=tp1):
+            return "TP1_ALCANZADO", f"Precio tocó TP1 ({tp1:.2f})"
+    # SL
+    if (d=="buy" and precio<=sl) or (d=="sell" and precio>=sl):
+        return "STOP_LOSS", f"Precio tocó Stop Loss ({sl:.2f})"
+
+    # Pre-entrada: invalidación / tardío / retorno
+    if state in ("IDEA_EN_FORMACION","ESPERANDO_PULLBACK","ENTRADA_VALIDA"):
+        prog = _progreso(sig, precio)
+        if prog > LATE_CANCEL:
+            return "CANCELAR_IDEA", f"Precio recorrió {prog*100:.0f}% hacia TP1 sin entrada — demasiado tarde"
+        if prog > LATE_PULLBACK and state != "ESPERANDO_PULLBACK":
+            return "ESPERANDO_PULLBACK", f"Precio avanzó {prog*100:.0f}% hacia TP1 — esperar retroceso a {e:.2f}"
+        if prog <= 0.12 and state == "ESPERANDO_PULLBACK":
+            return "ENTRADA_VALIDA", f"Precio regresó a zona de entrada tras pullback"
+        # Invalidación por cambio de tendencia
+        if df_h1 is not None and len(df_h1)>=50:
+            e50h1=_ema(df_h1.close,50).iloc[-1]
+            if d=="buy" and precio < e50h1*0.9995:
+                return "INVALIDADA", "H1 rompió EMA50 bajista — setup de compra invalidado"
+            if d=="sell" and precio > e50h1*1.0005:
+                return "INVALIDADA", "H1 rompió EMA50 alcista — setup de venta invalidado"
+        # Activar entrada
+        if state=="ENTRADA_VALIDA":
+            if (d=="buy" and precio>=e) or (d=="sell" and precio<=e):
+                return "EN_OPERACION", f"Precio cruzó nivel de entrada ({e:.2f})"
+    return None, None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSISTENCIA
+# ═══════════════════════════════════════════════════════════════════════════════
+def _load_st():
     try:
-        if _os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return []
+        if _os.path.exists(STATE_FILE):
+            with open(STATE_FILE,"r",encoding="utf-8") as f: return json.load(f)
+    except: pass
+    return {}
 
-def _save_history(data):
+def _save_st(data):
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data[-200:], f, ensure_ascii=False, indent=2)  # máx 200 señales
-    except Exception:
-        pass
+        with open(STATE_FILE,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
+    except: pass
 
-def _registrar_senal(s, symbol):
-    """Guarda una señal nueva si no existe ya (dedup por estrategia+dir+entry)"""
-    hist = _load_history()
-    ahora = datetime.now(timezone.utc).isoformat()
-    sig_id = f"{symbol}_{s['dir']}_{s['estrategia']}_{s['entry']:.2f}"
-    for h in hist:
-        if h.get("id") == sig_id:
-            return  # ya existe
-    hist.append({
-        "id":         sig_id,
-        "symbol":     symbol,
-        "dir":        s["dir"],
-        "tipo":       s.get("tipo",""),
-        "estrategia": s["estrategia"],
-        "score":      s["score"],
-        "entry":      round(s["entry"], 4),
-        "sl":         round(s["sl"], 4),
-        "tp1":        round(s["tp1"], 4),
-        "tp2":        round(s["tp2"], 4),
-        "tp3":        round(s["tp3"], 4),
-        "tp4":        round(s.get("tp4", s["tp3"]), 4),
-        "tp5":        round(s.get("tp5", s["tp3"]), 4),
-        "resultado":  None,
-        "ts":         ahora,
-    })
-    _save_history(hist)
+def _get_ast(symbol):
+    return _load_st().get(symbol, {"signal":None,"closed_at":None,"cooldown_until":None})
 
-def _actualizar_historial(symbol, precio_actual_):
-    """Verifica señales pendientes: ¿llegó al TP o al SL?"""
-    hist = _load_history()
-    cambio = False
-    for h in hist:
-        if h.get("symbol") != symbol or h.get("resultado") is not None:
-            continue
-        p = precio_actual_
-        if h["dir"] == "buy":
-            if   p >= h.get("tp5", float("inf")): h["resultado"] = "✅ TP5"; cambio = True
-            elif p >= h.get("tp4", float("inf")): h["resultado"] = "✅ TP4"; cambio = True
-            elif p >= h["tp3"]:                    h["resultado"] = "✅ TP3"; cambio = True
-            elif p >= h["tp2"]:                    h["resultado"] = "✅ TP2"; cambio = True
-            elif p >= h["tp1"]:                    h["resultado"] = "✅ TP1"; cambio = True
-            elif p <= h["sl"]:                     h["resultado"] = "❌ SL";  cambio = True
-        else:
-            if   p <= h.get("tp5", float("-inf")): h["resultado"] = "✅ TP5"; cambio = True
-            elif p <= h.get("tp4", float("-inf")): h["resultado"] = "✅ TP4"; cambio = True
-            elif p <= h["tp3"]:                     h["resultado"] = "✅ TP3"; cambio = True
-            elif p <= h["tp2"]:                     h["resultado"] = "✅ TP2"; cambio = True
-            elif p <= h["tp1"]:                     h["resultado"] = "✅ TP1"; cambio = True
-            elif p >= h["sl"]:                      h["resultado"] = "❌ SL";  cambio = True
-    if cambio:
-        _save_history(hist)
+def _set_ast(symbol, data):
+    st_data=_load_st(); st_data[symbol]=data; _save_st(st_data)
 
-def _wr_senal(estrategia):
-    """Win rate de esta estrategia desde el historial local."""
-    prefix = estrategia.split("—")[0].strip()
-    hist = _load_history()
-    rel   = [h for h in hist if h.get("estrategia","").startswith(prefix)]
-    done  = [h for h in rel  if h.get("resultado") is not None]
-    if len(done) < 2:
-        return None
-    wins  = sum(1 for h in done if str(h.get("resultado","")).startswith("✅"))
-    return round(wins / len(done) * 100)
-
-def _render_historial(symbol):
-    hist = [h for h in _load_history() if h.get("symbol") == symbol]
-    if not hist:
-        return
-    hist_rev = list(reversed(hist[-30:]))
-    total = len([h for h in hist if h.get("resultado")])
-    wins  = len([h for h in hist if str(h.get("resultado","")).startswith("✅")])
-    pend  = len([h for h in hist if h.get("resultado") is None])
-    wr    = f"{wins/total*100:.0f}%" if total > 0 else "—"
-
-    with st.expander(f"📋 Historial de señales ({len(hist)} total · WR: {wr} · {pend} pendientes)", expanded=False):
-        cols = st.columns([2, 1.2, 1.2, 1, 1, 1, 1.5, 1.5])
-        headers = ["Estrategia","Dir","Tipo","Score","Entrada","SL","Resultado","Fecha"]
-        for col, h in zip(cols, headers):
-            col.markdown(f"<span style='color:#555;font-size:.75em;font-weight:700'>{h}</span>",
-                         unsafe_allow_html=True)
-        st.markdown("<hr style='border:none;border-top:1px solid #1a1a30;margin:2px 0'>",
-                    unsafe_allow_html=True)
-        for h in hist_rev:
-            res = h.get("resultado") or "⏳ Pend."
-            res_color = "#00e676" if str(res).startswith("✅") else ("#ff5252" if str(res).startswith("❌") else "#888")
-            dir_color = "#00e676" if h["dir"]=="buy" else "#ff5252"
-            dir_txt   = "▲ BUY" if h["dir"]=="buy" else "▼ SELL"
-            ts_short  = h["ts"][:16].replace("T"," ") if h.get("ts") else "—"
-            cols2 = st.columns([2, 1.2, 1.2, 1, 1, 1, 1.5, 1.5])
-            vals = [
-                f"<span style='color:#aaa;font-size:.78em'>{h['estrategia'][:22]}</span>",
-                f"<span style='color:{dir_color};font-size:.78em;font-weight:700'>{dir_txt}</span>",
-                f"<span style='color:#888;font-size:.76em'>{h.get('tipo','')}</span>",
-                f"<span style='color:#ffd600;font-size:.78em'>{h['score']}</span>",
-                f"<span style='color:#ccc;font-size:.78em'>${h['entry']:,.2f}</span>",
-                f"<span style='color:#ff5252;font-size:.78em'>${h['sl']:,.2f}</span>",
-                f"<span style='color:{res_color};font-size:.78em;font-weight:700'>{res}</span>",
-                f"<span style='color:#444;font-size:.72em'>{ts_short}</span>",
-            ]
-            for col, v in zip(cols2, vals):
-                col.markdown(v, unsafe_allow_html=True)
-
+def _log_change(sig, new_state, msg):
+    ts=datetime.now(timezone.utc).strftime("%H:%M UTC")
+    sig.setdefault("log",[]).append({"ts":ts,"state":new_state,"msg":msg})
+    sig["state"]=new_state
+    sig["updated_at"]=datetime.now(timezone.utc).isoformat()
+    return sig
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UI
+# SELECCIÓN DE MEJOR SEÑAL
 # ═══════════════════════════════════════════════════════════════════════════════
-def _news_badge(nivel):
-    m = {"PELIGRO": "badge-danger", "PRECAUCIÓN": "badge-caution", "SEGURO": "badge-safe"}
-    return f'<span class="{m.get(nivel,"badge-safe")}">{nivel}</span>'
+def _select_best(candidatos, df_m1, df_m5, df_m15, df_h1, df_h4, precio, pen):
+    scored = []
+    for s in candidatos:
+        if s is None: continue
+        score, detail = _score_pro(s, df_m1, df_m5, df_m15, df_h1, df_h4, precio)
+        score = max(score - pen, 0)
+        if score < MIN_SCORE_SHOW: continue
+        prog = _progreso(s, precio)
+        if prog > LATE_CANCEL: continue
+        s["score"] = score
+        s["score_detail"] = detail
+        scored.append(s)
+    if not scored: return None, 0
+    # Mayor score, desempate por entrada más limpia
+    scored.sort(key=lambda x: (x["score"], x["score_detail"].get("entrada_limpia",0)), reverse=True)
+    # Score máximo visto (para el panel no-trade)
+    return scored[0], scored[0]["score"]
 
-_TIPO_CFG = {
-    "🎯 SCALP":    ("#2a1a00", "#ffd600", "#4a3000"),
-    "📅 INTRADAY": ("#001a2a", "#42a5f5", "#003a5a"),
-    "📊 SWING":    ("#001a0d", "#00e676", "#004020"),
+def _best_score_any(candidatos, df_m1, df_m5, df_m15, df_h1, df_h4, precio, pen):
+    """Devuelve el mejor score posible aunque sea < MIN. Para panel no-trade."""
+    best = 0
+    for s in candidatos:
+        if s is None: continue
+        score, _ = _score_pro(s, df_m1, df_m5, df_m15, df_h1, df_h4, precio)
+        score = max(score - pen, 0)
+        if score > best: best = score
+    return best
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOTOR DE ANÁLISIS — una llamada por activo
+# ═══════════════════════════════════════════════════════════════════════════════
+def _analizar(symbol, provider, pen):
+    precio, src = _price(symbol)
+    if precio is None: return None, None, None, None
+
+    pp = _pipval(symbol, src or provider)
+
+    df_m1  = _bars(symbol, mt5.TIMEFRAME_M1,  200)
+    df_m5  = _bars(symbol, mt5.TIMEFRAME_M5,  400)
+    df_m15 = _bars(symbol, mt5.TIMEFRAME_M15, 400)
+    df_h1  = _bars(symbol, mt5.TIMEFRAME_H1,  400)
+    df_h4  = _bars(symbol, mt5.TIMEFRAME_H4,  300)
+    df_d1  = _bars(symbol, mt5.TIMEFRAME_D1,  200)
+
+    ctx = _contexto_mtf(df_m1, df_m5, df_m15, df_h1, df_h4)
+    ast = _get_ast(symbol)
+    sig = ast.get("signal")
+
+    # ── Actualizar señal activa ────────────────────────────────────────────────
+    if sig and sig.get("state") not in _CLOSED:
+        new_st, motivo = _transition(sig, precio, df_h1, df_m15)
+        if new_st and new_st != sig.get("state"):
+            sig = _log_change(sig, new_st, motivo)
+            ast["signal"] = sig
+            if new_st in _CLOSED:
+                ast["closed_at"] = datetime.now(timezone.utc).isoformat()
+                ast["cooldown_until"] = (datetime.now(timezone.utc)+timedelta(minutes=COOLDOWN_MIN)).isoformat()
+            _set_ast(symbol, ast)
+
+    # ── Buscar nueva señal si no hay activa ────────────────────────────────────
+    sig_act = ast.get("signal")
+    en_cd = False
+    cd = ast.get("cooldown_until")
+    if cd:
+        try: en_cd = datetime.fromisoformat(cd) > datetime.now(timezone.utc)
+        except: pass
+
+    necesita_nueva = (sig_act is None or sig_act.get("state") in _CLOSED) and not en_cd
+
+    # Construir candidatos
+    gold = _is_gold(symbol)
+    candidatos = [
+        strat_london_breakout(df_h1, precio) if gold else None,
+        strat_trend_pullback(df_d1, df_h4, df_h1, df_m15, precio),
+        strat_ema_momentum(df_h1, df_m15, precio),
+        strat_supply_demand(df_h4, df_h1, precio),
+        strat_bb_squeeze(df_h1, precio),
+        strat_precio_accion(df_h1, precio, df_d1, df_h4),
+        strat_scalp_ema(df_m5, df_m15, df_h1, precio),
+        strat_scalp_momentum(df_m15, df_h1, precio),
+    ]
+
+    score_max = _best_score_any(candidatos, df_m1, df_m5, df_m15, df_h1, df_h4, precio, pen)
+
+    if necesita_nueva:
+        mejor, _ = _select_best(candidatos, df_m1, df_m5, df_m15, df_h1, df_h4, precio, pen)
+        if mejor:
+            d = mejor["sl_d"]
+            mejor.update(g1=d*1.5*pp, g2=d*2.5*pp, g3=d*4.0*pp, riesgo=d*pp)
+            prog = _progreso(mejor, precio)
+            if mejor["score"] >= MIN_SCORE_ENTRY and prog <= LATE_PULLBACK:
+                init = "ENTRADA_VALIDA"
+            elif mejor["score"] >= MIN_SCORE_ENTRY and prog <= LATE_CANCEL:
+                init = "ESPERANDO_PULLBACK"
+            elif mejor["score"] >= MIN_SCORE_SHOW:
+                init = "IDEA_EN_FORMACION"
+            else:
+                init = None
+
+            if init:
+                tipo_raw = mejor.get("tipo","INTRADAY")
+                mejor["tipo_razon"] = _razon_tipo(tipo_raw, ctx)
+                now = datetime.now(timezone.utc)
+                mejor["id"] = f"{symbol}_{mejor['dir']}_{now.strftime('%H%M')}"
+                mejor["created_at"] = now.isoformat()
+                mejor["updated_at"] = now.isoformat()
+                mejor["state"] = init
+                mejor["symbol"] = symbol
+                mejor["log"] = [{"ts":now.strftime("%H:%M UTC"),"state":init,
+                    "msg":f"{mejor['estrategia']} detectado · Score {mejor['score']}/100"}]
+                ast["signal"] = mejor
+                ast["closed_at"] = None
+                _set_ast(symbol, ast)
+                sig_act = mejor
+
+    razones_nt = _razones_no_trade(ctx, score_max, df_m5, df_h1) if not sig_act or sig_act.get("state") in _CLOSED else []
+
+    ind = {
+        "src":      src or provider,
+        "precio":   precio,
+        "atr_h1":   _atr(df_h1).iloc[-1] if df_h1 is not None else 0,
+        "rsi_h1":   _rsi(df_h1.close).iloc[-1] if df_h1 is not None else 50,
+        "e200_h1":  _ema(df_h1.close,200).iloc[-1] if df_h1 is not None else precio,
+        "score_max":score_max,
+        "razones_nt":razones_nt,
+        "df_m5":    df_m5,
+        "df_h1":    df_h1,
+    }
+    return ast, ctx, precio, ind
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UI — TARJETA PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════════
+def _render_card(sig, precio, decimals):
+    state = sig.get("state","IDEA_EN_FORMACION")
+    cfg   = _SC.get(state, _SC["IDEA_EN_FORMACION"])
+    d     = sig["dir"]
+    dc    = "#00e676" if d=="buy" else "#ff5252"
+    dt    = "▲ COMPRAR" if d=="buy" else "▼ VENDER"
+    tipo  = sig.get("tipo","INTRADAY")
+    score = sig.get("score",0)
+    sc_lbl, sc_col = _score_label(score)
+
+    def f(v): return _fmt(v, decimals)
+
+    accion = _ACCION.get(state,"")
+    prog   = _progreso(sig, precio)
+    prog_p = max(0, min(100, prog*100))
+    bar_c  = "#00e676" if d=="buy" else "#ff5252"
+
+    # Distancias
+    d_e  = abs(precio - sig["entry"])
+    d_sl = abs(precio - sig["sl"])
+    d_t1 = abs(precio - sig["tp1"])
+
+    tipo_razon = sig.get("tipo_razon","")
+
+    # Score breakdown pills
+    sd = sig.get("score_detail",{})
+    comp_names = {
+        "ctx_h1_h4":"H1/H4","conf_m15":"M15","setup_m5":"Setup M5",
+        "conf_m1":"M1","momentum":"Momentum","vol_atr":"Volatilidad","entrada_limpia":"Entrada"
+    }
+    comp_max  = {"ctx_h1_h4":20,"conf_m15":15,"setup_m5":25,"conf_m1":10,"momentum":10,"vol_atr":10,"entrada_limpia":10}
+    pills_html = ""
+    for k,n in comp_names.items():
+        v=sd.get(k,0); mx=comp_max[k]; pct=v/mx*100 if mx>0 else 0
+        pc="#00e676" if pct>=70 else ("#ffd600" if pct>=40 else "#ff5252")
+        pills_html += (f'<span style="background:#0a0a14;border:1px solid #1a1a28;border-radius:6px;'
+                       f'padding:3px 8px;font-size:.68em;margin:2px">'
+                       f'<span style="color:#444">{n}: </span>'
+                       f'<span style="color:{pc};font-weight:700">{v}/{mx}</span></span>')
+
+    st.markdown(f"""
+<div style="background:linear-gradient(145deg,{cfg['bg']},#08080f);
+  border:2px solid {cfg['color']};border-radius:14px;padding:1.5rem 1.8rem;margin-bottom:.6rem">
+
+  <!-- HEADER: estado + activo + score -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+    <div>
+      <div style="color:{cfg['color']};font-size:1.45em;font-weight:900;letter-spacing:.02em">
+        {cfg['icon']} {cfg['label']}
+      </div>
+      <div style="color:#777;font-size:.9em;margin-top:4px">
+        {sig.get('symbol','')} &nbsp;·&nbsp; {tipo} &nbsp;·&nbsp;
+        <span style="color:{dc};font-weight:700">{dt}</span> &nbsp;·&nbsp;
+        <span style="color:#555">{sig.get('icon','')} {sig.get('estrategia','')}</span>
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div style="color:{sc_col};font-size:2.2em;font-weight:900;line-height:1">{score}</div>
+      <div style="color:#333;font-size:.7em">/100 &nbsp; {sc_lbl}</div>
+    </div>
+  </div>
+
+  <hr style="border:none;border-top:1px solid #141422;margin:.5rem 0 .8rem 0">
+
+  <!-- PRECIOS -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:8px;margin-bottom:12px">
+    <div style="background:#0c0c18;border:1px solid #1c1c2e;border-radius:8px;padding:10px 14px">
+      <div style="color:#333;font-size:.65em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Entrada ideal</div>
+      <div style="color:#fff;font-size:1.1em;font-weight:700">{f(sig['entry'])}</div>
+      <div style="color:#444;font-size:.72em;margin-top:2px">Ahora: <span style="color:#aaa">{f(precio)}</span></div>
+    </div>
+    <div style="background:#120008;border:1px solid #2e0010;border-radius:8px;padding:10px 14px">
+      <div style="color:#333;font-size:.65em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Stop Loss</div>
+      <div style="color:#ff5252;font-size:1.1em;font-weight:700">{f(sig['sl'])}</div>
+      <div style="color:#444;font-size:.72em;margin-top:2px">Riesgo: {f(sig['sl_d'])} pts</div>
+    </div>
+    <div style="background:#081408;border:1px solid #182a18;border-radius:8px;padding:10px 14px">
+      <div style="color:#333;font-size:.65em;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Objetivos (RR)</div>
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <span style="color:#69f0ae;font-size:.85em;font-weight:700">TP1&nbsp;{f(sig['tp1'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr1']:.1f}</span></span>
+        <span style="color:#00e676;font-size:.85em;font-weight:700">TP2&nbsp;{f(sig['tp2'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr2']:.1f}</span></span>
+        <span style="color:#ffd600;font-size:.85em;font-weight:700">TP3&nbsp;{f(sig['tp3'])}<span style="color:#333;font-size:.75em"> ·1:{sig['rr3']:.1f}</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ACCIÓN -->
+  <div style="background:#0a0a14;border-left:3px solid {cfg['color']};border-radius:0 8px 8px 0;
+    padding:10px 14px;margin-bottom:10px">
+    <div style="color:{cfg['color']};font-size:.75em;font-weight:700;text-transform:uppercase;
+      letter-spacing:.06em;margin-bottom:3px">Acción recomendada</div>
+    <div style="color:#ccc;font-size:.9em">{accion}</div>
+  </div>
+
+  <!-- PROGRESO HACIA TP1 -->
+  <div style="margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span style="color:#333;font-size:.7em">Avance hacia TP1</span>
+      <span style="color:{bar_c};font-size:.76em;font-weight:700">{prog_p:.0f}%
+        {"— en zona" if prog_p<=15 else ("— PULLBACK" if prog_p<=60 else "— TARDE")}</span>
+    </div>
+    <div style="background:#0e0e1a;border-radius:4px;height:5px;overflow:hidden">
+      <div style="background:{bar_c};height:5px;width:{min(prog_p,100):.0f}%;
+        border-radius:4px;transition:width .3s"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:3px;color:#222;font-size:.65em">
+      <span>Entrada {f(sig['entry'])}</span><span>TP1 {f(sig['tp1'])}</span>
+    </div>
+  </div>
+
+  <!-- TIPO + MOTIVO -->
+  <div style="background:#080812;border:1px solid #12122a;border-radius:8px;padding:8px 12px;margin-bottom:8px">
+    <div style="color:#333;font-size:.68em;font-weight:700;text-transform:uppercase;
+      letter-spacing:.06em;margin-bottom:3px">Por qué {tipo}</div>
+    <div style="color:#555;font-size:.8em">{tipo_razon}</div>
+  </div>
+
+  <!-- SCORE BREAKDOWN -->
+  <div style="margin-top:6px">{pills_html}</div>
+
+</div>""", unsafe_allow_html=True)
+
+
+def _render_tracking(sig, precio, decimals):
+    """Panel de seguimiento numérico debajo de la tarjeta."""
+    d=sig["dir"]; state=sig.get("state","")
+    def f(v): return _fmt(v, decimals)
+    prog_p = max(0, min(100, _progreso(sig, precio)*100))
+    bar_c  = "#00e676" if d=="buy" else "#ff5252"
+    ts     = sig.get("updated_at","")[:16].replace("T"," ")+" UTC" if sig.get("updated_at") else "—"
+
+    d_entry = abs(precio - sig["entry"])
+    d_sl    = abs(precio - sig["sl"])
+    d_tp1   = abs(precio - sig["tp1"])
+    d_tp2   = abs(precio - sig["tp2"])
+
+    st.markdown(f"""
+<div style="background:#080810;border:1px solid #141426;border-radius:10px;
+  padding:1rem 1.4rem;margin-bottom:.6rem">
+  <div style="color:#252540;font-size:.68em;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;margin-bottom:10px">Seguimiento en vivo</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">
+    <div style="background:#0c0c18;border:1px solid #14142a;border-radius:7px;padding:8px 10px">
+      <div style="color:#2a2a44;font-size:.65em">PRECIO ACTUAL</div>
+      <div style="color:#fff;font-weight:700;font-size:.95em">{f(precio)}</div>
+    </div>
+    <div style="background:#0c0c18;border:1px solid #14142a;border-radius:7px;padding:8px 10px">
+      <div style="color:#2a2a44;font-size:.65em">A ENTRADA</div>
+      <div style="color:#ffd600;font-weight:700;font-size:.95em">{f(d_entry)} pts</div>
+    </div>
+    <div style="background:#0c0c18;border:1px solid #14142a;border-radius:7px;padding:8px 10px">
+      <div style="color:#2a2a44;font-size:.65em">A STOP LOSS</div>
+      <div style="color:#ff5252;font-weight:700;font-size:.95em">{f(d_sl)} pts</div>
+    </div>
+    <div style="background:#0c0c18;border:1px solid #14142a;border-radius:7px;padding:8px 10px">
+      <div style="color:#2a2a44;font-size:.65em">A TP1</div>
+      <div style="color:#69f0ae;font-weight:700;font-size:.95em">{f(d_tp1)} pts</div>
+    </div>
+  </div>
+  <div style="background:#0e0e1a;border-radius:4px;height:4px;overflow:hidden;margin-bottom:4px">
+    <div style="background:{bar_c};height:4px;width:{min(prog_p,100):.0f}%;border-radius:4px"></div>
+  </div>
+  <div style="color:#1e1e36;font-size:.68em">Última actualización: {ts}</div>
+</div>""", unsafe_allow_html=True)
+
+
+def _render_mtf(ctx):
+    cells = ""
+    for tf in ["H4","H1","M15","M5","M1"]:
+        t   = ctx.get(tf,{}); color=t.get("color","#333"); lbl=t.get("label","?")
+        rsi = t.get("rsi"); rsi_txt=f"<br><span style='color:#252540;font-size:.62em'>RSI {rsi:.0f}</span>" if rsi else ""
+        cells += (f'<div style="background:#0a0a14;border:1px solid #14142a;border-radius:8px;'
+                  f'padding:8px 6px;text-align:center">'
+                  f'<div style="color:#1e1e36;font-size:.65em;font-weight:700;margin-bottom:2px">{tf}</div>'
+                  f'<div style="color:{color};font-size:.75em;font-weight:700">{lbl}{rsi_txt}</div></div>')
+    st.markdown(f"""
+<div style="margin-bottom:.7rem">
+  <div style="color:#1e1e36;font-size:.65em;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;margin-bottom:6px">Análisis Multi-Temporal</div>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">{cells}</div>
+</div>""", unsafe_allow_html=True)
+
+
+def _render_no_trade(razones, ctx, score_max, symbol):
+    h1lbl  = ctx.get("H1",{}).get("label","?")
+    m15lbl = ctx.get("M15",{}).get("label","?")
+    m5lbl  = ctx.get("M5",{}).get("label","?")
+    bar_w  = min(score_max,100)
+    bar_c  = "#ff5252" if score_max<70 else "#ffd600"
+    reasons_html = "".join(
+        f'<div style="color:#444;font-size:.82em;padding:4px 0;border-bottom:1px solid #0e0e18">'
+        f'<span style="color:#2a2a44">▸ </span>{r}</div>'
+        for r in razones
+    )
+    next_action = "Esperar ruptura de zona clave o retroceso a EMA con confirmación M15."
+    st.markdown(f"""
+<div style="background:#09090f;border:1px solid #161622;border-radius:12px;
+  padding:1.4rem 1.8rem;margin-bottom:.6rem">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+    <div>
+      <div style="color:#ff5252;font-size:1.3em;font-weight:900">🔴 NO OPERAR · {symbol}</div>
+      <div style="color:#2a2a40;font-size:.82em;margin-top:4px">Sin setup válido en este momento</div>
+    </div>
+    <div style="text-align:right">
+      <div style="color:{bar_c};font-size:1.8em;font-weight:900;line-height:1">{score_max}</div>
+      <div style="color:#222;font-size:.68em">/100 · score actual</div>
+    </div>
+  </div>
+
+  <!-- Score bar -->
+  <div style="background:#0e0e18;border-radius:4px;height:4px;margin-bottom:4px;overflow:hidden">
+    <div style="background:{bar_c};height:4px;width:{bar_w}%;border-radius:4px"></div>
+  </div>
+  <div style="color:#1e1e30;font-size:.68em;margin-bottom:12px">
+    Mínimo para señal: {MIN_SCORE_SHOW}/100 &nbsp;·&nbsp; Para entrada válida: {MIN_SCORE_ENTRY}/100
+  </div>
+
+  <!-- Razones -->
+  <div style="margin-bottom:12px">
+    <div style="color:#252540;font-size:.7em;font-weight:700;text-transform:uppercase;
+      letter-spacing:.08em;margin-bottom:6px">Por qué no hay trade:</div>
+    {reasons_html}
+  </div>
+
+  <!-- Qué esperar -->
+  <div style="background:#0c0c18;border-left:2px solid #252540;padding:8px 12px;border-radius:0 6px 6px 0">
+    <div style="color:#2a2a44;font-size:.7em;font-weight:700;margin-bottom:2px">ACCIÓN</div>
+    <div style="color:#444;font-size:.82em">{next_action}</div>
+  </div>
+
+  <!-- Contexto actual -->
+  <div style="margin-top:10px;color:#1e1e2e;font-size:.72em">
+    H1: {h1lbl} &nbsp;·&nbsp; M15: {m15lbl} &nbsp;·&nbsp; M5: {m5lbl}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+
+def _render_cerrada(sig, decimals):
+    state=sig.get("state",""); cfg=_SC.get(state,_SC["INVALIDADA"])
+    logs=sig.get("log",[]); last_msg=logs[-1].get("msg","") if logs else ""
+    def f(v): return _fmt(v, decimals)
+    st.markdown(f"""
+<div style="background:#08080e;border:1px solid #141420;border-radius:10px;
+  padding:.9rem 1.2rem;margin-bottom:.6rem;opacity:.75">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <div style="color:{cfg['color']};font-size:1em;font-weight:700">{cfg['icon']} {cfg['label']}</div>
+      <div style="color:#333;font-size:.78em;margin-top:2px">
+        {sig.get('estrategia','')} · {('▲ BUY' if sig.get('dir')=='buy' else '▼ SELL')} ·
+        Entrada {f(sig.get('entry',0))} · SL {f(sig.get('sl',0))}
+      </div>
+      <div style="color:#252535;font-size:.74em;margin-top:3px">{last_msg}</div>
+    </div>
+    <div style="color:#222;font-size:.7em">Score {sig.get('score',0)}/100</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+
+def _render_log(sig):
+    logs = sig.get("log",[])
+    if not logs: return
+    with st.expander(f"📋 Historial de cambios · {len(logs)} eventos", expanded=False):
+        for e in reversed(logs):
+            cfg=_SC.get(e.get("state",""),{"color":"#333","icon":"·"})
+            st.markdown(
+                f'<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid #0c0c18;'
+                f'font-size:.78em;align-items:baseline">'
+                f'<span style="color:#1e1e30;min-width:68px">{e.get("ts","")}</span>'
+                f'<span style="color:{cfg["color"]};min-width:18px">{cfg["icon"]}</span>'
+                f'<span style="color:#3a3a55">{e.get("msg","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+
+def _alert_state_change(symbol, prev_state, curr_state):
+    if not prev_state or prev_state == curr_state: return
+    cfg = _SC.get(curr_state,{})
+    st.toast(f"{symbol}: {cfg.get('icon','')} {cfg.get('label','')}", icon="📡")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RENDER POR ACTIVO
+# ═══════════════════════════════════════════════════════════════════════════════
+_SRC_BADGE = {
+    "MT5":   '<span style="background:#0a1430;color:#42a5f5;padding:2px 9px;border-radius:10px;font-size:.7em;font-weight:700">📊 MT5 en vivo</span>',
+    "Yahoo": '<span style="background:#140e00;color:#ffd600;padding:2px 9px;border-radius:10px;font-size:.7em;font-weight:700">🌐 Yahoo Finance</span>',
 }
 
-def _tipo_badge(tipo):
-    bg, fg, br = _TIPO_CFG.get(tipo, ("#1a1a30", "#aaa", "#333"))
-    return (f'<span style="background:{bg};color:{fg};border:1px solid {br};'
-            f'padding:2px 10px;border-radius:12px;font-size:.72em;font-weight:700">{tipo}</span>')
+def _sesion():
+    h=datetime.now(timezone.utc).hour
+    if   h< 7: return "🌏 ASIÁTICA","#42a5f5"
+    elif h<12: return "🇬🇧 LONDRES","#00e676"
+    elif h<17: return "🇺🇸 NUEVA YORK","#ff9800"
+    else:       return "🌙 FUERA HORARIO","#555"
 
-def _card(s, news_nivel, news_txt, decimals=2):
-    def f(v): return _fmt(v, decimals)
-    cls, col, stars = _clase(s["score"])
-    dc  = "#00e676" if s["dir"] == "buy" else "#ff5252"
-    dt  = "▲ COMPRA" if s["dir"] == "buy" else "▼ VENTA"
-    cc  = "card-buy"  if s["dir"] == "buy" else "card-sell"
-    nb  = _news_badge(news_nivel)
-    tb  = _tipo_badge(s.get("tipo",""))
-    dur = s.get("duracion","")
+def _render_activo(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix):
+    with st.spinner(f"Analizando {symbol}…"):
+        ast, ctx, precio, ind = _analizar(symbol, provider, pen)
 
-    # Rango de entrada: ±15 % del riesgo
-    ez = s["sl_d"] * 0.15
-    if s["dir"] == "buy":
-        e_lo, e_hi = s["entry"] - ez, s["entry"] + ez
+    if ast is None:
+        st.error(f"❌ Sin conexión a datos para {symbol}. Verifica internet o MT5.")
+        return
+
+    sig     = ast.get("signal")
+    src     = ind["src"]
+    score_max = ind["score_max"]
+
+    # ── Alertas de cambio de estado ────────────────────────────────────────────
+    state_key = f"last_state_{tab_prefix}"
+    prev_st = st.session_state.get(state_key)
+    curr_st = sig.get("state") if sig and sig.get("state") not in _CLOSED else "BUSCANDO_SETUP"
+    _alert_state_change(symbol, prev_st, curr_st)
+    st.session_state[state_key] = curr_st
+
+    # ── Header compacto ────────────────────────────────────────────────────────
+    tend   = "▲ ALCISTA" if precio > ind["e200_h1"] else "▼ BAJISTA"
+    tend_c = "#00e676"   if "ALCISTA" in tend       else "#ff5252"
+    badge  = _SRC_BADGE.get(src, _SRC_BADGE["Yahoo"])
+
+    col1, col2, col3, col4, col5 = st.columns([1.2,1,1,1,1.5])
+    col1.metric(f"💰 {symbol}", f"{_fmt(precio, decimals)}")
+    col2.metric("ATR H1",    f"{ind['atr_h1']:.{decimals}f}")
+    col3.metric("RSI H1",    f"{ind['rsi_h1']:.0f}")
+    col4.metric("Tendencia", tend)
+    with col5:
+        st.markdown(f'<div style="padding:8px 0">{badge}</div>', unsafe_allow_html=True)
+
+    # ── Noticias ───────────────────────────────────────────────────────────────
+    news_colors = {"PELIGRO":"#c62828","PRECAUCION":"#ff9800","SEGURO":"#00c853"}
+    nc = news_colors.get(n_nivel,"#00c853")
+    st.markdown(f"""
+<div style="background:#080810;border:1px solid #141420;border-radius:8px;
+  padding:.5rem 1rem;margin:.4rem 0 .8rem 0;font-size:.82em">
+  <span style="color:#252540">📰 Noticias USD: </span>
+  <span style="color:{nc};font-weight:700">{n_txt}</span>
+  {('<span style="color:#c62828;font-weight:900;margin-left:12px">⛔ NO OPERAR durante noticias</span>' if n_nivel=="PELIGRO" else "")}
+</div>""", unsafe_allow_html=True)
+
+    # ── Contexto MTF ───────────────────────────────────────────────────────────
+    _render_mtf(ctx)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #0e0e1a;margin:.3rem 0 .7rem 0'>", unsafe_allow_html=True)
+
+    # ── Señal activa o señal cerrada reciente ──────────────────────────────────
+    tiene_activa = sig and sig.get("state") not in _CLOSED
+
+    if tiene_activa:
+        # Señal viva — tarjeta principal + tracking
+        _render_card(sig, precio, decimals)
+        _render_tracking(sig, precio, decimals)
+        _render_log(sig)
+
+        # Botón para cerrar manualmente
+        if st.button(f"🗑️ Descartar señal manualmente", key=f"del_{tab_prefix}"):
+            sig = _log_change(sig, "INVALIDADA", "Cerrado manualmente por el usuario")
+            ast["signal"] = sig
+            ast["closed_at"] = datetime.now(timezone.utc).isoformat()
+            ast["cooldown_until"] = (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+            _set_ast(symbol, ast)
+            st.rerun()
+
     else:
-        e_lo, e_hi = s["entry"] - ez, s["entry"] + ez
+        # Sin señal activa
+        # Si hay una señal reciente cerrada, mostrarla (dim)
+        if sig and sig.get("state") in _CLOSED:
+            _render_cerrada(sig, decimals)
+            # Cooldown countdown
+            cd = ast.get("cooldown_until")
+            if cd:
+                try:
+                    rem = (datetime.fromisoformat(cd)-datetime.now(timezone.utc)).total_seconds()
+                    if rem > 0:
+                        st.markdown(f'<div style="color:#1e1e30;font-size:.74em;margin-bottom:.6rem">'
+                                    f'⏱ Buscando nuevo setup en {int(rem/60)}m {int(rem%60)}s…</div>',
+                                    unsafe_allow_html=True)
+                except: pass
 
-    # Win rate desde historial
-    wr = _wr_senal(s["estrategia"])
-    wr_html = (f'<span style="background:#0a2a0a;color:#69f0ae;border:1px solid #1a4a1a;'
-               f'padding:2px 9px;border-radius:10px;font-size:.72em;font-weight:700">'
-               f'WR {wr}%</span>') if wr is not None else ""
-
-    return f"""
-<div class="{cc}">
-  <!-- CABECERA -->
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
-    <div>
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <span style="color:{dc};font-size:1.3em;font-weight:900">{dt}</span>
-        <span style="color:#bbb;font-size:.92em">{s['icon']} {s['estrategia']}</span>
-      </div>
-      <div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        {tb}
-        <span style="color:#555;font-size:.74em">⏱ {dur}</span>
-        {wr_html}
-      </div>
-    </div>
-    <div style="text-align:right">{nb}</div>
-  </div>
-
-  <!-- SCORE + ENTRADA + STOP -->
-  <div style="display:flex;gap:0;flex-wrap:wrap;margin-bottom:12px;
-              background:#0a0a15;border:1px solid #1a1a30;border-radius:8px;overflow:hidden">
-    <div style="flex:1;padding:10px 16px;border-right:1px solid #1a1a30;min-width:90px">
-      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Score</div>
-      <div style="color:{col};font-size:1.6em;font-weight:900;line-height:1.1">{s['score']}</div>
-      <div style="color:{col};font-size:.72em">{cls}</div>
-    </div>
-    <div style="flex:2;padding:10px 16px;border-right:1px solid #1a1a30;min-width:140px">
-      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Zona de Entrada</div>
-      <div style="color:#fff;font-size:1.0em;font-weight:700">{f(e_lo)} — {f(e_hi)}</div>
-      <div style="color:#888;font-size:.74em">Precio exacto: {f(s['entry'])}</div>
-    </div>
-    <div style="flex:2;padding:10px 16px;min-width:140px">
-      <div style="color:#555;font-size:.68em;text-transform:uppercase;letter-spacing:.05em">Stop Loss</div>
-      <div style="color:#ff5252;font-size:1.0em;font-weight:700">{f(s['sl'])}</div>
-      <div style="color:#555;font-size:.74em">Riesgo: {s['sl_d']:.{decimals}f} pts</div>
-    </div>
-  </div>
-
-  <!-- TPs -->
-  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:10px">
-    <div style="background:#071507;border:1px solid #143214;border-radius:6px;padding:6px 8px;text-align:center">
-      <div style="color:#555;font-size:.64em">TP1 · 1:{s['rr1']:.1f}</div>
-      <div style="color:#69f0ae;font-weight:700;font-size:.9em">{f(s['tp1'])}</div>
-    </div>
-    <div style="background:#071507;border:1px solid #1a4a1a;border-radius:6px;padding:6px 8px;text-align:center">
-      <div style="color:#555;font-size:.64em">TP2 · 1:{s['rr2']:.1f}</div>
-      <div style="color:#00e676;font-weight:700;font-size:.9em">{f(s['tp2'])}</div>
-    </div>
-    <div style="background:#071507;border:1px solid #206020;border-radius:6px;padding:6px 8px;text-align:center">
-      <div style="color:#555;font-size:.64em">TP3 · 1:{s['rr3']:.1f}</div>
-      <div style="color:#00e676;font-weight:800;font-size:.9em">{f(s['tp3'])}</div>
-    </div>
-    <div style="background:#0d0d00;border:1px solid #3a3000;border-radius:6px;padding:6px 8px;text-align:center">
-      <div style="color:#555;font-size:.64em">TP4 · 1:{s['rr4']:.1f}</div>
-      <div style="color:#ffd600;font-weight:800;font-size:.9em">{f(s['tp4'])}</div>
-    </div>
-    <div style="background:#150a00;border:1px solid #4a2000;border-radius:6px;padding:6px 8px;text-align:center">
-      <div style="color:#555;font-size:.64em">TP5 · 1:{s['rr5']:.1f}</div>
-      <div style="color:#ff9800;font-weight:900;font-size:.9em">{f(s['tp5'])}</div>
-    </div>
-  </div>
-
-  <!-- Contexto -->
-  <div style="color:#555;font-size:.80em;padding-top:6px;border-top:1px solid #111">{s['contexto']}</div>
-</div>"""
-
-def _texto(s, news_txt):
-    dt = "▲ BUY  /  COMPRA" if s["dir"] == "buy" else "▼ SELL  /  VENTA"
-    ts = datetime.now(timezone.utc).strftime("%d/%m/%Y  %H:%M UTC")
-    tipo = s.get("tipo", "")
-    dur  = s.get("duracion", "")
-    return (
-        f"🥇 RAVEN TRADE IDEAS · XAUUSD ORO\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dt}\n"
-        f"{s['icon']}  {s['estrategia']}\n"
-        f"Score: {s['score']}/100  ·  {s['clase']}\n"
-        f"{tipo}  ·  ⏱ {dur}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entrada:  {_fmt(s['entry'])}\n"
-        f"🛑 Stop:     {_fmt(s['sl'])}   (−{s['sl_d']:.2f} pts)\n"
-        f"🎯 TP1:      {_fmt(s['tp1'])}   1:{s['rr1']:.1f}\n"
-        f"🎯 TP2:      {_fmt(s['tp2'])}   1:{s['rr2']:.1f}\n"
-        f"🎯 TP3:      {_fmt(s['tp3'])}   1:{s['rr3']:.1f}\n"
-        f"💎 TP4:      {_fmt(s['tp4'])}   1:{s['rr4']:.1f}\n"
-        f"🏆 TP5:      {_fmt(s['tp5'])}   1:{s['rr5']:.1f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📰 Noticias: {news_txt}\n"
-        f"ℹ️  {s['contexto']}\n"
-        f"⏰  {ts}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+        # Panel de no-trade
+        _render_no_trade(ind["razones_nt"], ctx, score_max, symbol)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-_SRC_BADGE = {
-    "MT5":   '<span style="background:#0a1a40;color:#42a5f5;padding:2px 9px;border-radius:12px;font-size:.72em;font-weight:700">📊 MT5 en vivo</span>',
-    "Yahoo": '<span style="background:#1a1000;color:#ffd600;padding:2px 9px;border-radius:12px;font-size:.72em;font-weight:700">🌐 Yahoo Finance</span>',
-}
-
-def _render_senales(symbol, provider, n_nivel, n_txt, pen, decimals, tab_prefix):
-    # ── 1. FILTRO PRIMERO — antes de cargar/calcular nada ─────────────────────
-    tipo_sel = st.radio(
-        "Tipo de operación:",
-        ["🔎 TODOS", "🎯 SCALP", "📅 INTRADAY", "📊 SWING"],
-        horizontal=True, key=f"tipo_{tab_prefix}",
-        help="SCALP: 5-45 min  |  INTRADAY: 1-8h  |  SWING: 4-24h"
-    )
-    st.markdown("<hr style='border:none;border-top:1px solid #1a1a30;margin:.5rem 0 .8rem 0'>",
-                unsafe_allow_html=True)
-
-    # ── 2. Precio actual ──────────────────────────────────────────────────────
-    precio, src = _get_price(symbol)
-    if precio is None:
-        st.error(f"❌ Sin datos para **{symbol}**. Verifica tu conexión a internet.")
-        return
-
-    # ── 3. Barras — solo las que necesita el filtro elegido ───────────────────
-    need_scalp    = tipo_sel in ("🔎 TODOS", "🎯 SCALP")
-    need_intraday = tipo_sel in ("🔎 TODOS", "📅 INTRADAY")
-    need_swing    = tipo_sel in ("🔎 TODOS", "📊 SWING")
-
-    with st.spinner(f"Calculando señales {tipo_sel} para {symbol}…"):
-        df_m5  = _get_bars(symbol, mt5.TIMEFRAME_M5,  300)[0] if need_scalp    else None
-        df_m15 = _get_bars(symbol, mt5.TIMEFRAME_M15, 400)[0] if (need_scalp or need_intraday or need_swing) else None
-        df_h1  = _get_bars(symbol, mt5.TIMEFRAME_H1,  400)[0]
-        df_h4  = _get_bars(symbol, mt5.TIMEFRAME_H4,  300)[0] if (need_swing or need_intraday) else None
-        df_d1  = _get_bars(symbol, mt5.TIMEFRAME_D1,  200)[0] if (need_swing or need_intraday) else None
-
-    _actualizar_historial(symbol, precio)
-
-    pp     = _pip_val(symbol, src or provider)
-    at_h1  = _atr(df_h1).iloc[-1]        if df_h1 is not None else 0
-    rsi_h1 = _rsi(df_h1.close).iloc[-1]  if df_h1 is not None else 50
-    e200   = _ema(df_h1.close, 200).iloc[-1] if df_h1 is not None else precio
-    tend   = "▲ ALCISTA" if precio > e200 else "▼ BAJISTA"
-
-    badge = _SRC_BADGE.get(src or provider, _SRC_BADGE["Yahoo"])
-    st.markdown(f'<div style="margin-bottom:6px">{badge}</div>', unsafe_allow_html=True)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"💰 {symbol}", _fmt(precio, decimals))
-    c2.metric("📊 ATR H1",       f"{at_h1:.{decimals}f} pts")
-    c3.metric("📈 RSI H1",       f"{rsi_h1:.0f}")
-    c4.metric("🧭 TENDENCIA H1", tend)
-
-    # ── 4. Ejecutar SOLO estrategias del tipo seleccionado ────────────────────
-    yt      = _yahoo_ticker(symbol)
-    is_gold = (yt == "GC=F") or ("xau" in symbol.lower())
-
-    candidatos = []
-    if need_intraday and is_gold:
-        candidatos.append(strat_london_breakout(df_h1, precio))
-    if need_swing:
-        candidatos.append(strat_trend_pullback(df_d1, df_h4, df_h1, df_m15, precio))
-        candidatos.append(strat_supply_demand(df_h4, df_h1, precio))
-    if need_intraday:
-        candidatos.append(strat_ema_momentum(df_h1, df_m15, precio))
-        candidatos.append(strat_bb_squeeze(df_h1, precio))
-        candidatos.append(strat_precio_accion(df_h1, precio, df_d1, df_h4))
-    if need_scalp:
-        candidatos.append(strat_scalp_ema(df_m5, df_m15, df_h1, precio))
-        candidatos.append(strat_scalp_momentum(df_m15, df_h1, precio))
-
-    # ── 5. Construir lista de señales válidas ─────────────────────────────────
-    senales = []
-    for s in candidatos:
-        if s is None:
-            continue
-        s.setdefault("tipo",    "📅 INTRADAY")
-        s.setdefault("duracion","—")
-        d = s["sl_d"]
-        s.update(
-            g1=d*1.5*pp, g2=d*2.5*pp, g3=d*4.0*pp,
-            g4=d*6.0*pp, g5=d*9.0*pp, riesgo=d*pp
-        )
-        # Recalcular TPs con decimals correctos (precios son absolutos, ya están bien)
-        s["score"] = max(s["score_base"] - pen, 0)
-        if s["score"] < MIN_SCORE:
-            continue
-        cls, col, st_s = _clase(s["score"])
-        s["clase"] = cls; s["color"] = col; s["stars"] = st_s
-        senales.append(s)
-
-    senales.sort(key=lambda x: x["score"], reverse=True)
-
-    # ── 6. Resolución de conflictos BUY vs SELL ───────────────────────────────
-    conflicto_txt = None
-    buys  = [s for s in senales if s["dir"] == "buy"]
-    sells = [s for s in senales if s["dir"] == "sell"]
-    if buys and sells:
-        max_buy  = max(s["score"] for s in buys)
-        max_sell = max(s["score"] for s in sells)
-        diff     = abs(max_buy - max_sell)
-        if diff >= 10:
-            dominant  = "sell" if max_sell > max_buy else "buy"
-            senales   = [s for s in senales if s["dir"] == dominant]
-            conflicto_txt = (
-                f"⚡ Conflicto detectado — "
-                f"{'VENTA' if dominant=='sell' else 'COMPRA'} domina "
-                f"({max(max_buy,max_sell)}/100 vs {min(max_buy,max_sell)}/100)"
-            )
-        else:
-            conflicto_txt = (
-                f"⚠️ Mercado indeciso — BUY {max_buy}/100 vs SELL {max_sell}/100. "
-                f"Espera confirmación."
-            )
-            senales = []
-
-    senales_filtradas = senales
-
-    # Guardar en historial
-    for s in senales_filtradas:
-        _registrar_senal(s, symbol)
-
-    ts_str  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    n_strats_map = {"🎯 SCALP": 2, "📅 INTRADAY": 3 + (1 if is_gold else 0),
-                    "📊 SWING": 2, "🔎 TODOS": 7 + (1 if is_gold else 0)}
-    n_strats = n_strats_map.get(tipo_sel, 7)
-
-    if conflicto_txt:
-        dom_color = ("#ffd600" if (buys and sells and not senales)
-                     else ("#00e676" if senales and senales[0]["dir"]=="buy" else "#ff5252"))
-        st.markdown(f"""
-        <div style="background:#0d0d20;border:1px solid #2a2a00;border-radius:8px;
-             padding:.8rem 1.2rem;margin-bottom:.8rem;font-size:.85em;color:{dom_color}">
-          {conflicto_txt}
-        </div>""", unsafe_allow_html=True)
-
-    if n_nivel == "PELIGRO":
-        st.markdown(f"""
-        <div style="background:#1a0000;border:2px solid #c62828;border-radius:10px;
-             padding:1.2rem;text-align:center;margin-bottom:1rem">
-          <div style="color:#ff5252;font-size:1.2em;font-weight:900">🔴 ZONA DE PELIGRO — NOTICIAS ACTIVAS</div>
-          <div style="color:#888;margin-top:4px;font-size:.9em">{n_txt}</div>
-        </div>""", unsafe_allow_html=True)
-
-    if not senales_filtradas:
-        msg = f"Sin señales {tipo_sel}" if tipo_sel != "🔎 TODOS" else "Sin señales activas"
-        st.markdown(f"""
-        <div class="no-signal">
-          <div style="font-size:2em;margin-bottom:6px">🔍</div>
-          <div style="color:#666">{msg}</div>
-          <div style="color:#333;font-size:.82em;margin-top:6px">
-            {n_strats} estrategias monitoreando {symbol} · {ts_str}
-          </div>
-        </div>""", unsafe_allow_html=True)
-    else:
-        n_sf = len(senales_filtradas)
-        st.markdown(f"<div style='color:#555;font-size:.82em;margin-bottom:6px'>"
-                    f"✅ {n_sf} señal{'es' if n_sf>1 else ''} · {tipo_sel} · {ts_str}</div>",
-                    unsafe_allow_html=True)
-        for i, s in enumerate(senales_filtradas):
-            st.markdown(_card(s, n_nivel, n_txt, decimals), unsafe_allow_html=True)
-            key = f"{tab_prefix}_{i}_{s['estrategia'].replace(' ','_')}_{int(s['score'])}"
-            if st.button("📋 Copiar señal", key=key):
-                st.session_state[f"show_{key}"] = not st.session_state.get(f"show_{key}", False)
-            if st.session_state.get(f"show_{key}", False):
-                st.code(_texto(s, n_txt), language=None)
-
-    # ── HISTORIAL ─────────────────────────────────────────────────────────────
-    st.markdown("<div style='margin-top:1.5rem'></div>", unsafe_allow_html=True)
-    _render_historial(symbol)
-
-
 def main():
-    sesion, ses_color = _sesion()
-    eventos  = _fetch_news()
-    n_nivel, n_txt = _riesgo_news(eventos)
-    pen = {"PELIGRO": 30, "PRECAUCIÓN": 10, "SEGURO": 0}.get(n_nivel, 0)
+    sesion, ses_col = _sesion()
+    ev               = _fetch_news()
+    n_nivel, n_txt   = _news_risk(ev)
+    pen              = {"PELIGRO":35,"PRECAUCION":12,"SEGURO":0}.get(n_nivel,0)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    nb = _news_badge(n_nivel)
+    nb_colors = {"PELIGRO":"#c62828","PRECAUCION":"#ff9800","SEGURO":"#00c853"}
+    nb_c = nb_colors.get(n_nivel,"#00c853")
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#07070f,#150a00);border:1px solid #3d2b00;
-         border-radius:12px;padding:1.2rem 1.8rem;margin-bottom:1rem;
-         display:flex;align-items:center;justify-content:space-between">
-      <div>
-        <div style="color:#ffd600;font-size:1.5em;font-weight:900">🥇 RAVEN TRADE IDEAS · ORO &amp; DJ30</div>
-        <div style="color:#555;font-size:.85em;margin-top:2px">
-          XAUUSD + DJ30 · 6 estrategias · Filtro noticias en tiempo real
-        </div>
-      </div>
-      <div style="text-align:right">
-        <div style="color:{ses_color};font-size:1em;font-weight:700">{sesion}</div>
-        <div style="margin-top:4px">{nb}</div>
-      </div>
-    </div>""", unsafe_allow_html=True)
+<div style="background:linear-gradient(135deg,#07070e,#12090a);border:1px solid #2a1800;
+  border-radius:12px;padding:1rem 1.6rem;margin-bottom:.8rem;
+  display:flex;align-items:center;justify-content:space-between">
+  <div>
+    <div style="color:#ffd600;font-size:1.4em;font-weight:900">🥇 RAVEN TRADE IDEAS</div>
+    <div style="color:#2a2220;font-size:.82em;margin-top:2px">
+      XAUUSD &amp; DJ30 · Asistente profesional de señales · Una idea por activo
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div style="color:{ses_col};font-size:.9em;font-weight:700">{sesion}</div>
+    <div style="margin-top:3px">
+      <span style="background:{nb_c};color:{'#000' if n_nivel!='PELIGRO' else '#fff'};
+        padding:2px 10px;border-radius:12px;font-size:.74em;font-weight:700">{n_nivel}</span>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
 
-    # ── Barra noticias ────────────────────────────────────────────────────────
-    nc = {"PELIGRO": "#c62828", "PRECAUCIÓN": "#ff9800", "SEGURO": "#00c853"}
-    st.markdown(f"""
-    <div class="news-bar">
-      <span style="color:#555">📰 NOTICIAS USD (afectan Oro y DJ30):</span>
-      <span style="color:{nc.get(n_nivel,'#00c853')};font-weight:700;margin-left:8px">{n_txt}</span>
-    </div>""", unsafe_allow_html=True)
+    _mt5_ok()  # intentar MT5 silenciosamente
 
-    ahora = datetime.now(timezone.utc)
-    prox = [e for e in eventos if (e["dt"]-ahora).total_seconds() > 0][:3]
-    if prox:
-        html_ev = "  ".join(
-            f'<span style="color:#3a3a5a;font-size:.78em">⏰ {e["titulo"]} {e["dt"].strftime("%d/%m %H:%M")} UTC</span>'
-            for e in prox)
-        st.markdown(f'<div style="margin-bottom:.8rem">{html_ev}</div>', unsafe_allow_html=True)
-
-    # MT5 intentar silenciosamente — si no está, usamos Yahoo Finance
-    _mt5_ok()
-
-    # Buscar símbolos — MT5 si está abierto, Yahoo Finance si no
     with st.spinner("Detectando fuente de datos…"):
-        xau_sym,  xau_prov  = _find_xauusd()
+        xau_sym, xau_prov = _find_xauusd()
         dj30_sym, dj30_prov = _find_dj30()
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    oro_label  = f"🥇 {xau_sym}  · ORO"  if xau_sym  else "🥇 ORO (sin datos)"
-    dj30_label = f"📈 {dj30_sym} · DJ30" if dj30_sym else "📈 DJ30 (sin datos)"
-    tabs = st.tabs([oro_label, dj30_label])
+    oro_lbl  = f"🥇 ORO · {xau_sym}"  if xau_sym  else "🥇 ORO (sin datos)"
+    dj30_lbl = f"📈 DJ30 · {dj30_sym}" if dj30_sym else "📈 DJ30 (sin datos)"
+    tab1, tab2 = st.tabs([oro_lbl, dj30_lbl])
 
-    with tabs[0]:
+    with tab1:
         if xau_sym:
-            _render_senales(xau_sym, xau_prov, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
+            _render_activo(xau_sym, xau_prov, n_nivel, n_txt, pen, decimals=2, tab_prefix="oro")
         else:
-            st.markdown("""
-            <div class="no-signal">
-              <div style="font-size:2em;margin-bottom:8px">⚠️</div>
-              <div style="color:#aaa;font-weight:700">No hay datos para el Oro</div>
-              <div style="color:#444;font-size:.85em;margin-top:8px">
-                • Abre MT5 con tu cuenta para datos en tiempo real<br>
-                • O verifica tu conexión a internet (Yahoo Finance como fallback)
-              </div>
-            </div>""", unsafe_allow_html=True)
+            st.markdown("""<div style="color:#333;text-align:center;padding:3rem">
+              ⚠️ Sin datos para Oro. Abre MT5 o verifica tu conexión.</div>""",
+              unsafe_allow_html=True)
 
-    with tabs[1]:
+    with tab2:
         if dj30_sym:
-            _render_senales(dj30_sym, dj30_prov, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
+            _render_activo(dj30_sym, dj30_prov, n_nivel, n_txt, pen, decimals=0, tab_prefix="dj30")
         else:
-            st.markdown("""
-            <div class="no-signal">
-              <div style="font-size:2em;margin-bottom:8px">⚠️</div>
-              <div style="color:#aaa;font-weight:700">No hay datos para DJ30</div>
-              <div style="color:#444;font-size:.85em;margin-top:8px">
-                • Abre MT5 con tu cuenta para datos en tiempo real<br>
-                • O verifica tu conexión a internet (Yahoo Finance como fallback)
-              </div>
-            </div>""", unsafe_allow_html=True)
+            st.markdown("""<div style="color:#333;text-align:center;padding:3rem">
+              ⚠️ Sin datos para DJ30. Abre MT5 o verifica tu conexión.</div>""",
+              unsafe_allow_html=True)
 
-    # ── Footer + Refresh ──────────────────────────────────────────────────────
     st.markdown("""
-    <div style="color:#1a1a30;font-size:.72em;text-align:center;margin-top:2rem;
-         padding-top:1rem;border-top:1px solid #0d0d20">
-      RAVEN TRADE IDEAS · Solo educativo · Gestiona siempre tu riesgo
-    </div>""", unsafe_allow_html=True)
+<div style="color:#0e0e1a;font-size:.7em;text-align:center;margin-top:1.5rem;
+  padding-top:.8rem;border-top:1px solid #0a0a14">
+  RAVEN TRADE IDEAS · Solo educativo · Gestiona siempre tu riesgo
+</div>""", unsafe_allow_html=True)
 
     time.sleep(REFRESH)
     st.rerun()
-
 
 if __name__ == "__main__":
     main()
